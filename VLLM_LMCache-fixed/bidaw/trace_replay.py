@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Length-driven synthetic replay of Bidaw's timestamped trace.
+"""Replay Bidaw's timestamped trace with generated answers in the history.
 
-Prompts are exact, append-only token-ID prefixes, frozen by SHA-256 seeds.
-Synthetic historical answers are filler, NOT the model's actual answers; this
-is a cache/I/O microbenchmark, not a semantic conversation or full paper repro.
-Generation uses ignore_eos and reports the actual completion-token usage.
+Query token IDs are generated from stable per-user seeds. Each round appends
+the model's returned token IDs verbatim before the next query.
+Generation uses ignore_eos and validates completion lengths against the trace.
 Each user has a task sharing one epoch; --parallel limits active HTTP calls,
 not active sessions. A dependent round is sent only after its predecessor.
 Client queue/dependency delays are recorded separately from server latency.
@@ -21,7 +20,6 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Any
 
 DEMO_DIR = Path(__file__).resolve().parents[1]
 MODEL_NAME = 'qwen2.5-1.5b-instruct'
@@ -69,47 +67,30 @@ def select_users(users, n_users, seed=0):
     return ordered[:n_users] if n_users > 0 else ordered
 
 
-class PromptBuilder:
-    """Exact token IDs; no text decode/encode round trip or Python hash()."""
-    def __init__(self, tokenizer, uid, seed=0):
-        self.rng = random.Random(stable_seed(seed, uid))
-        words = 'memory storage request cache tensor disk attention model user history'
-        self.pool = tokenizer.encode(words, add_special_tokens=False)
-        if not self.pool:
-            raise ValueError('Empty token pool')
-        self.tokens = []
-        self.history_len = 0
-
-    def build_prompt(self, query_tokens, round_idx, max_prompt_tokens):
-        length = self.history_len + query_tokens
-        if length < 1 or length > max_prompt_tokens:
-            return [], length, True
-        while len(self.tokens) < length:
-            self.tokens.append(self.rng.choice(self.pool))
-        return list(self.tokens[:length]), length, False
-
-    def advance(self, qlen, rlen):
-        self.history_len += qlen + rlen
-        while len(self.tokens) < self.history_len:
-            self.tokens.append(self.rng.choice(self.pool))
-
-
 def build_schedule(users, picked, tokenizer, args):
+    words = 'memory storage request cache tensor disk attention model user history'
+    pool = tokenizer.encode(words, add_special_tokens=False)
+    if not pool:
+        raise ValueError('Empty token pool')
     t0 = min(users[u][0]['ts'] for u in picked)
     schedules, digest = {}, hashlib.sha256()
     truncated = []
     for uid in picked:
-        b = PromptBuilder(tokenizer, uid, args['seed'])
+        rng = random.Random(stable_seed(args['seed'], uid))
+        history_len = 0
         rows = []
         for r in users[uid]:
-            prompt, length, stop = b.build_prompt(r['qlen'], r['rnd'], args['max_prompt_tokens'])
-            if stop or length + r['rlen'] > args['max_model_len']:
+            prompt_len = history_len + r['qlen']
+            if (not 1 <= prompt_len <= args['max_prompt_tokens']
+                    or prompt_len + r['rlen'] > args['max_model_len']):
                 truncated.append(dict(user=uid, round=r['rnd'], reason='context_limit'))
                 break
-            row = dict(r, prompt=prompt, due=(r['ts'] - t0) / args['speed'])
+            query_ids = [rng.choice(pool) for _ in range(r['qlen'])]
+            row = dict(r, query_token_ids=query_ids, prompt_tokens=prompt_len,
+                       due=(r['ts'] - t0) / args['speed'])
             rows.append(row)
             digest.update(json.dumps([uid, row], sort_keys=True, separators=(',', ':')).encode())
-            b.advance(r['qlen'], r['rlen'])
+            history_len = prompt_len + r['rlen']
         schedules[uid] = rows
     return schedules, digest.hexdigest(), truncated
 
@@ -118,9 +99,11 @@ def stream_ttft(base, prompt, salt, max_tokens, model):
     import requests
     payload = dict(model=model, prompt=prompt, max_tokens=max_tokens,
                    temperature=0.0, ignore_eos=True, stream=True,
+                   add_special_tokens=False, return_token_ids=True,
                    stream_options={'include_usage': True}, cache_salt=salt)
     started, first, usage = time.perf_counter(), None, None
     chunks = []
+    completion_ids = []
     with requests.post(f'{base}/v1/completions', json=payload,
                        stream=True, timeout=(10, 600)) as resp:
         resp.raise_for_status()
@@ -136,17 +119,34 @@ def stream_ttft(base, prompt, salt, max_tokens, model):
             if item.get('usage'):
                 usage = item['usage']
             for choice in item.get('choices', []):
-                text = choice.get('text') or ''
-                if text and first is None:
+                echoed_prompt = choice.get('prompt_token_ids')
+                if echoed_prompt is not None and echoed_prompt != prompt:
+                    raise RuntimeError('vLLM returned different prompt token IDs')
+                delta_ids = choice.get('token_ids')
+                if delta_ids is None:
+                    if choice.get('text'):
+                        raise RuntimeError('vLLM stream is missing completion token IDs')
+                    continue
+                if not isinstance(delta_ids, list) or any(
+                    type(token_id) is not int or token_id < 0 for token_id in delta_ids
+                ):
+                    raise RuntimeError('vLLM returned invalid completion token IDs')
+                if delta_ids and first is None:
                     first = time.perf_counter()
-                chunks.append(text)
+                completion_ids.extend(delta_ids)
+                chunks.append(choice.get('text') or '')
     ended = time.perf_counter()
     if not usage or usage.get('completion_tokens') != max_tokens:
         raise RuntimeError(f'Expected {max_tokens} completion tokens, got usage={usage}')
     if usage.get('prompt_tokens') != len(prompt):
         raise RuntimeError(f'Prompt length mismatch: {len(prompt)} vs usage={usage}')
+    if len(completion_ids) != max_tokens:
+        raise RuntimeError(
+            f'Expected {max_tokens} completion token IDs, received {len(completion_ids)}'
+        )
     return dict(text=''.join(chunks), ttft_s=(first or ended) - started,
-                total_s=ended - started, completion_tokens=usage['completion_tokens'])
+                total_s=ended - started, completion_tokens=usage['completion_tokens'],
+                completion_token_ids=completion_ids)
 
 
 def report_answer(lmc, salt, answer_tokens):
@@ -208,48 +208,46 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
 
     async def replay_user(uid, rows):
         salt = f"{args['salt_prefix']}-{uid}"
+        history = []
         previous_failed = False
+        warmup_skipped = False
         track_fates = args.get('track_chunk_fates') and not args.get('no_cache')
         complete = bool(rows) and uid not in args.get('truncated_fate_users', ())
         for row in rows:
             phase = 'warmup' if row['due'] < warmup else 'measure'
             record = dict(user=salt, round=row['rnd'], ts=row['ts'],
                           qlen=row['qlen'], rlen=row['rlen'],
-                          prompt_tokens=len(row['prompt']), phase=phase,
+                          prompt_tokens=row['prompt_tokens'], phase=phase,
                           scheduled_s=row['due'])
             if previous_failed:
                 record['error'] = 'previous_round_failed'
                 records.append(record)
                 continue
+            if warmup_skipped:
+                record['skip_reason'] = 'missing_warmup_history'
+                records.append(record)
+                continue
             await asyncio.sleep(max(0, epoch + row['due'] - time.perf_counter()))
             if phase == 'measure':
                 await boundary_task
-            # Warm-up requests that fall behind the boundary are skipped,
-            # never contaminate metrics.  They do NOT break the chain: the
-            # schedule builds prompts from deterministic filler tokens and
-            # never back-fills model answers (FIXES.md #9/#96-97), so a
-            # skipped round does not change any later round's prompt bytes.
-            # The chain still breaks on real request failures below.
-            elif time.perf_counter() >= epoch + warmup:
-                complete = False
-                record['error'] = 'warmup_overrun'
-                records.append(record)
-                continue
             async with sem:
                 if phase == 'warmup' and time.perf_counter() >= epoch + warmup:
-                    complete = False
-                    record['error'] = 'warmup_overrun'
+                    # Without this reply, later rounds have no exact prefix.
+                    warmup_skipped = True
+                    record['skip_reason'] = 'warmup_overrun'
                     records.append(record)
                     continue
                 try:
                     if track_fates:
                         await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'start')
+                    prompt = history + row['query_token_ids']
                     record['sent_s'] = time.perf_counter() - epoch
                     record['scheduling_lag_ms'] = 1000 * (record['sent_s'] - row['due'])
-                    result = await asyncio.to_thread(sender, args['vllm'], row['prompt'],
+                    result = await asyncio.to_thread(sender, args['vllm'], prompt,
                         salt, row['rlen'], args['model'])
                     # Capture network completion before the reporting HTTP call.
                     record['completed_s'] = time.perf_counter() - epoch
+                    history = prompt + result['completion_token_ids']
                     record.update(ttft_ms=result['ttft_s'] * 1000,
                                   total_ms=result['total_s'] * 1000,
                                   offered_latency_ms=1000 * (record['completed_s'] - row['due']),
@@ -264,6 +262,9 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                         await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'finish')
                         if complete and row is rows[-1]:
                             await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'session_end')
+                    record['prompt_sha256'] = hashlib.sha256(
+                        json.dumps(prompt, separators=(',', ':')).encode()
+                    ).hexdigest()
                 except Exception as exc:
                     record['error'] = str(exc)
                     previous_failed = True
@@ -345,10 +346,19 @@ def main():
         args['truncated_fate_users'] = [entry['user'] for entry in truncated]
     records, before, after, wall = asyncio.run(execute_schedule(schedules, args))
     delta = {k: after.get(k, 0) - before.get(k, 0) for k in set(before) | set(after)}
-    measured = [r for r in records if r['phase'] == 'measure' and 'error' not in r]
+    executed_prompts = sorted(
+        (r['user'], r['round'], r['prompt_sha256'])
+        for r in records if 'prompt_sha256' in r
+    )
+    executed_digest = hashlib.sha256(
+        json.dumps(executed_prompts, separators=(',', ':')).encode()
+    ).hexdigest()
+    measured = [r for r in records if r['phase'] == 'measure' and 'prompt_sha256' in r]
     errors = [r for r in records if 'error' in r]
-    summary = dict(label=args['label'], args=args, content_mode='synthetic_token_prefix',
-                   schedule_sha256=digest, planned_arrival_rate=rate,
+    skipped = sum('skip_reason' in r for r in records)
+    summary = dict(label=args['label'], args=args, content_mode='generated_token_prefix',
+                   schedule_sha256=digest, executed_prompt_sha256=executed_digest,
+                   planned_arrival_rate=rate,
                    measured_interval_s=duration, wall_s=wall,
                    truncated_sessions=truncated, metrics_before=before,
                    metrics_after=after, metrics_delta=delta, records=records)
@@ -357,17 +367,12 @@ def main():
             values = [r[field] for r in measured]
             print(f'{field}: mean={sum(values)/len(values):.2f} '
                   f'p99={percentile(values,.99):.2f}')
-    print(f'[summary] measured_ok={len(measured)} errors={len(errors)} wall={wall:.2f}s')
+    print(f'[summary] measured_ok={len(measured)} errors={len(errors)} '
+          f'skipped={skipped} wall={wall:.2f}s')
     out = Path(args['out'] or DEMO_DIR / 'logs' / f"trace_replay_{args['label']}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
-    # Exit non-zero only for REAL failures.  'warmup_overrun' skips are
-    # expected once a system saturates (the offered schedule outruns a
-    # no-cache baseline); they are recorded but never measured, so they
-    # must not fail the sweep's fail-fast pipeline.
-    fatal = [r for r in records
-             if r.get('error') not in (None, 'warmup_overrun')]
-    return 1 if fatal or not measured else 0
+    return 1 if errors or not measured else 0
 
 
 if __name__ == '__main__':

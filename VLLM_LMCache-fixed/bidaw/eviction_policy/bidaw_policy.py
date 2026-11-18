@@ -12,9 +12,9 @@ Bidirectional Computation-Storage Awareness`` (Hu et al., FAST'26):
 * A background ghost cache that replays the recent access trace through
   Belady's optimal algorithm to estimate, per WRD bucket, the hit rate an
   optimal strategy would achieve (paper section 3.3.2/3.3.3).
-* Eviction candidates are selected at USER granularity: the salt whose next
-  access has the lowest predicted hit potential (paper eq. 2) is evicted
-  first, whole histories at a time.
+* Eviction candidates with a salt are selected at user granularity by
+  predicted hit potential (paper eq. 2). Unsalted keys are individual
+  candidates with neutral potential and LRU ordering.
 
 Units: WRD is tracked in "distinct equal-sized keys" (uniform chunk size makes bytes and
 key counts monotonically equivalent); the small-bucket threshold is the L1
@@ -80,8 +80,8 @@ class BidawEvictionPolicy(EvictionPolicy):
         self._ghost_last_error = None
         self._lb_samples = defaultdict(lambda: deque(maxlen=512))
         self._logical_requests = 0
-        self._tracked: dict[ObjectKey, str] = {}      # key -> salt
-        self._salt_last_touch: dict[str, float] = {}  # salt -> wall clock
+        self._tracked: dict[ObjectKey, float] = {}  # key -> last resident touch
+        self._salt_last_touch: dict[str, float] = {}  # salt -> monotonic time
         self._salt_hist: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=64)
         )
@@ -109,13 +109,12 @@ class BidawEvictionPolicy(EvictionPolicy):
 
     def on_keys_created(self, keys: list[ObjectKey]) -> None:
         with self._lock:
+            now = time.monotonic()
             for key in keys:
-                self._tracked[key] = key.cache_salt or ""
+                self._tracked[key] = now
 
     def on_keys_touched(self, keys: list[ObjectKey]) -> None:
-        with self._lock:
-            for key in keys:
-                self._tracked[key] = key.cache_salt or ""
+        self.on_keys_created(keys)
 
     def on_keys_removed(self, keys: list[ObjectKey]) -> None:
         with self._lock:
@@ -129,9 +128,13 @@ class BidawEvictionPolicy(EvictionPolicy):
         key_eligible_filter=None,
         cache_salt: str | None = None,
     ) -> list[EvictionAction]:
+        if not 0 < expected_ratio <= 1:
+            return []
         with self._lock:
             by_salt: dict[str, list[ObjectKey]] = defaultdict(list)
-            for key, salt in self._tracked.items():
+            scored: list[tuple[bool, float, float, list[ObjectKey]]] = []
+            for key, last_touch in self._tracked.items():
+                salt = key.cache_salt or ""
                 if cache_salt is not None and salt != cache_salt:
                     continue
                 if key_eligible_filter is not None:
@@ -140,50 +143,44 @@ class BidawEvictionPolicy(EvictionPolicy):
                             continue
                     except Exception:  # noqa: BLE001
                         continue
-                by_salt[salt].append(key)
-            if not by_salt:
+                if salt:
+                    by_salt[salt].append(key)
+                else:
+                    scored.append((False, 0.5, last_touch, [key]))
+            total = len(scored) + sum(len(keys) for keys in by_salt.values())
+            if not total:
                 return []
 
-            total = sum(len(v) for v in by_salt.values())
-            if not 0 < expected_ratio <= 1:
-                return []
             target = max(1, math.ceil(expected_ratio * total))
             now = time.monotonic()
 
-            scored = []
+            salt_potentials = {}
             for salt, keys in by_salt.items():
                 last_touch = self._salt_last_touch.get(salt, 0.0)
-                grace_ok = (now - last_touch) >= self._grace_seconds
-                potential = self._potential(salt, respect_lb=grace_ok)
-                scored.append((grace_ok, potential, last_touch, salt, keys))
+                in_grace = (now - last_touch) < self._grace_seconds
+                potential = self._potential(salt, respect_lb=not in_grace)
+                scored.append((in_grace, potential, last_touch, keys))
+                if len(salt_potentials) < 6:
+                    salt_potentials[salt] = round(potential, 3)
 
-            # lowest potential first; non-recent (out-of-grace) salts before
-            # protected ones; last-touch time as final tie-breaker.
-            scored.sort(key=lambda t: (not t[0], t[1], t[2]))
+            # Prefer out-of-grace candidates, then low potential and old touches.
+            scored.sort(key=lambda candidate: candidate[:3])
 
-            actions: list[EvictionAction] = []
-            evicted = 0
-            for _grace, _pot, _lt, _salt, keys in scored:
-                if evicted >= target:
+            selected: list[ObjectKey] = []
+            for _grace, _potential, _last_touch, keys in scored:
+                selected.extend(keys)
+                if len(selected) >= target:
                     break
-                actions.append(
-                    EvictionAction(
-                        destination=EvictionDestination.DISCARD,
-                        keys=list(keys),
-                    )
-                )
-                evicted += len(keys)
-            if actions:
-                logger.info(
-                    "Bidaw eviction: keys=%d salts=%d target=%d -> evicted "
-                    "%d keys; salt potentials: %s",
-                    total,
-                    len(by_salt),
-                    target,
-                    evicted,
-                    {s: round(p, 3) for _g, p, _lt, s, _k in scored[:6]},
-                )
-            return actions
+            logger.info(
+                "Bidaw eviction: keys=%d salts=%d target=%d selected=%d; "
+                "salt potentials: %s",
+                total,
+                len(by_salt),
+                target,
+                len(selected),
+                salt_potentials,
+            )
+            return [EvictionAction(destination=EvictionDestination.DISCARD, keys=selected)]
 
     # ------------------------------------------------------------------
     # Bidaw-specific API (invoked via policy_registry / HTTP)
@@ -212,7 +209,7 @@ class BidawEvictionPolicy(EvictionPolicy):
                 "ghost_last_error": self._ghost_last_error,
                 "grace_seconds": self._grace_seconds,
                 "tracked_keys": len(self._tracked),
-                "salts": len(set(self._tracked.values())),
+                "salts": len({key.cache_salt or "" for key in self._tracked}),
                 # diagnostic: resident-at-end identities so post-hoc analysis
                 # can split never-SSD-read chunks into A (still L1-resident)
                 # vs B (evicted, never read). Kept short (bounded by L1 cap).
@@ -254,9 +251,10 @@ class BidawEvictionPolicy(EvictionPolicy):
                 salt = key.cache_salt or ""
                 self._seq += 1
                 wrd = self._reuse.access(kid)
-                if wrd is not None:
-                    self._record_wrd(salt, float(wrd))
-                self._salt_last_touch[salt] = now
+                if salt:
+                    if wrd is not None:
+                        self._record_wrd(salt, float(wrd))
+                    self._salt_last_touch[salt] = now
                 self._trace.append((kid, salt))
             self._ensure_ghost_thread()
 
@@ -413,9 +411,11 @@ class BidawEvictionPolicy(EvictionPolicy):
         if not hist:
             return 0.5  # no evidence: neutral; recency breaks ties
 
-        answer_len = self._salt_last_answer.get(salt, 0)
-        bin_id = min(answer_len // _LB_BIN_TOKENS, 63)
-        lb = self._lb_min.get(bin_id) if respect_lb else None
+        answer_len = self._salt_last_answer.get(salt)
+        lb = None
+        if respect_lb and answer_len is not None:
+            bin_id = min(answer_len // _LB_BIN_TOKENS, 63)
+            lb = self._lb_min.get(bin_id)
 
         small = prom = extreme = 0
         total = 0

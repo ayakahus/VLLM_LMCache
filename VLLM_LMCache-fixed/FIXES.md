@@ -36,12 +36,14 @@ python3 -m unittest discover -s tests -v
    派发时删除时间戳，避免完成路径重插入导致的泄漏。
 8. 重放改为共享 epoch 的异步会话；并发上限只限制 HTTP，不占满整场会话。
    保留轮间依赖，单轮失败停止后续依赖请求；记录计划/实际发送/完成时间。
-9. SHA-256 种子，直接发送 token IDs；跨进程一致且严格保持前缀。
-   输出 ignore_eos；用 SSE usage 校验实际输出长度，并上报实际长度。
+9. 查询 token IDs 由稳定的 SHA-256 种子生成。通过 vLLM 的 `return_token_ids`
+   收集流式回答的实际 token IDs，校验 SSE usage 和 token 数，再原样接入下一轮前缀。
+   被跳过的预热轮没有可用回答，同一会话的依赖轮也会跳过。
 10. 同一条轨迹前段预热，后段测量，绝不重放未来数据。
     边界暂停准入并等待在途请求/回答上报结束，再取 metrics_before。
-11. 报告仅使用测量窗口数据和指标差值，单列 L1/L2 命中率、客户端延迟、错误、
-    截断会话数；自动检查各臂轨迹 digest/预热/并发参数一致性，不写死加速结论。
+11. 报告使用测量窗口数据和指标差值，单列 L1/L2 命中率、客户端延迟、错误、
+    跳过轮次及截断会话数。横向对比同时核对计划轨迹、预热及并发参数、实际发送的
+    prompt 指纹。模型生成分歧或预热跳过造成的输入差异会被标记。
 12. 扫描脚本改为四臂消融 + 无缓存基线，所有点使用相同预热配置；失败立即退出。
 
 ## 在目标 GPU 服务器验证
@@ -60,7 +62,7 @@ source env.sh
 ./reset_for_policy.sh Bidaw 1
 curl -fsS http://127.0.0.1:8080/bidaw/status
 
-# 先验证输入构建；不发送请求
+# 验证查询 token 和上下文长度规划
 python3 bidaw/trace_replay.py --users 35 --speed 60 \
   --warmup-seconds 30 --dry-run
 
@@ -93,8 +95,8 @@ python3 bidaw/repro_report.py
   必须在原服务器上完成上述单臂验证，再开展性能结论比较。
 - DQ 调整的是 LMCache 预取准入；未修改 vLLM GPU scheduler，不能宣称已完整复现
   论文的 GPU 就绪队列顺序。应进一步采集 vLLM 的请求准入和 GPU 开始计算时间。
-- 负载是长度驱动的合成 token 前缀：历史回答使用固定填充 token，不回填模型实际
-  输出。这保证各臂输入完全相同，适合缓存/I/O 微基准，不代表真实语义多轮对话。
+- 负载的时间和长度来自轨迹，查询内容为合成 token，历史回答来自实际生成。
+  该设置可用于验证 decode KV 的跨轮复用。实际命中取决于连接器已保存的完整 KV 块。
 - 当前只适用于同模型、同大小 BF16 chunk 的实验。默认 Qwen2.5-1.5B、256 token
   chunk 为 7,340,032 bytes；切换模型/dtype/chunk/并行度时，显式修改
   BIDAW_CHUNK_BYTES 或 BIDAW_L1_CAPACITY_KEYS。不同大小对象需要字节加权扩展。

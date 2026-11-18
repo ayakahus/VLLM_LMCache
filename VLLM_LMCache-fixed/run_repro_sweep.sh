@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Target-server experiment. Resets services and clears this demo's L2 .data files.
-# All arms use the same continuous warm-up and exact token-ID schedule.
+# All arms use the same warm-up and query schedule. The report compares actual prompts.
 set -euo pipefail
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DEMO_DIR"
