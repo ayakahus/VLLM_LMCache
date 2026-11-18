@@ -1,0 +1,7 @@
+nohup: ignoring input
+[schedule] users=35 rounds=668 measured_new_users=0 planned_arrival_rate=0.000/min sha256=035faa81af8cf4cacbfd1b6587a4d1ca50cf08f3af90d90dd7e76149d09f3890 truncated_sessions=1
+total_ms: mean=289.97 p99=1056.65
+ttft_ms: mean=100.68 p99=129.55
+offered_latency_ms: mean=301.33 p99=1067.99
+scheduling_lag_ms: mean=10.76 p99=102.38
+[summary] measured_ok=106 errors=0 skipped=0 wall=56.67s

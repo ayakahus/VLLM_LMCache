@@ -1,0 +1,2 @@
+nohup: ignoring input
+Hint: The `hf-cli` skill is not installed. Run `hf skills add -g` to teach your AI agents how to use the `hf` CLI.

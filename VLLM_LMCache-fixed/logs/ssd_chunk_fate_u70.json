@@ -1,0 +1,32 @@
+{
+  "classes": {
+    "A": 0,
+    "B": 0,
+    "C": 63,
+    "U": 296
+  },
+  "bytes": {
+    "A": 0,
+    "B": 0,
+    "C": 462422016,
+    "U": 2172649472
+  },
+  "cat4": {
+    "C": 358,
+    "A": 0,
+    "B": 1,
+    "U": 0
+  },
+  "cat4_bytes": {
+    "C": 2627731456,
+    "A": 0,
+    "B": 7340032,
+    "U": 0
+  },
+  "physical_writes": 359,
+  "unique": 359,
+  "rewrite_events": 0,
+  "load_events": 6136,
+  "unattributed_load_events": 37,
+  "delete_events": 0
+}

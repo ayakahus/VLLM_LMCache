@@ -1,0 +1,17 @@
+Confirmed physical writes: 359
+Unique L2 locations written: 359
+Physical rewrites: 0
+Backend load events: 6136
+Loads with no matching write in this run: 37
+Delete events: 0
+
+A All observed later lookups hit DRAM: 0 writes (0.0%), 0.00 GiB
+B Final-round write evicted unread: 0 writes (0.0%), 0.00 GiB
+C Bidaw eviction and preparing-queue readback: 63 writes (17.5%), 0.43 GiB
+U Unresolved: 296 writes (82.5%), 2.02 GiB
+
+=== 4-category chunk fate (user semantics, evidence-based) ===
+C C effective: read back from SSD >= 1 time: 358 chunks (99.7%), 2.45 GiB
+A A DRAM-retained: later lookups all served from L1: 0 chunks (0.0%), 0.00 GiB
+B B dead write: evicted, user never returned: 1 chunks (0.3%), 0.01 GiB
+U U unresolved: late write / mixed / undetermined: 0 chunks (0.0%), 0.00 GiB

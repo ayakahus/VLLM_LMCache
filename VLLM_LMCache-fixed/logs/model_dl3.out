@@ -1,0 +1,3 @@
+nohup: ignoring input
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+path=/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/models/Qwen2.5-1.5B-Instruct

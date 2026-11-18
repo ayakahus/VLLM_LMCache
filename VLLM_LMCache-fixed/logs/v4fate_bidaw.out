@@ -1,0 +1,3 @@
+nohup: ignoring input
+[schedule] users=70 rounds=1361 measured_new_users=0 planned_arrival_rate=0.000/min sha256=726d6ae029273e21a4b1784e44ddfc89214130ab593938a2d57b81c16bf9ece1 truncated_sessions=1
+[summary] measured_ok=0 errors=0 skipped=300 wall=30.58s

@@ -1,0 +1,31 @@
+{
+  "report_version": 3,
+  "probe_version": 4,
+  "run_id": "248680a30fef4c45bda1ab71bbcf068a",
+  "classes": {
+    "A": 0,
+    "B": 0,
+    "C": 84,
+    "U": 584
+  },
+  "bytes": {
+    "A": 0,
+    "B": 0,
+    "C": 616562688,
+    "U": 4286578688
+  },
+  "physical_writes": 668,
+  "padded_tail_writes": 452,
+  "writes_without_round_evidence": 0,
+  "unique": 668,
+  "rewrite_events": 0,
+  "load_events": 5875,
+  "unattributed_load_events": 5691,
+  "attributed_load_events": 184,
+  "attributed_loads_per_write": 0.2754491017964072,
+  "writes_read_back": 114,
+  "readback_prefetch_write_pairs": 184,
+  "qualifying_prefetch_write_pairs": 127,
+  "completed_replay_sessions": 48,
+  "delete_events": 0
+}
