@@ -39,11 +39,12 @@ class FateRound(BaseModel):
     cache_salt: str = Field(min_length=1)
     round_index: int = Field(ge=0)
     phase: Literal["start", "finish", "session_end"]
+    round_id: str | None = Field(default=None, min_length=1)
 
 
 @router.post("/bidaw/fate/round")
 def report_fate_round(body: FateRound) -> dict[str, bool]:
-    if not record_round(body.cache_salt, body.round_index, body.phase):
+    if not record_round(body.cache_salt, body.round_index, body.phase, body.round_id):
         raise HTTPException(status_code=409, detail="L2 event probe is disabled")
     return {"recorded": True}
 

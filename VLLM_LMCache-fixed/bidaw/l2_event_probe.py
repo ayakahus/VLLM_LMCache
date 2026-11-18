@@ -13,10 +13,10 @@ from bidaw.padded_tail import TAIL_VALID_TOKENS
 _log = None
 
 
-def record_round(cache_salt, round_index, phase):
+def record_round(cache_salt, round_index, phase, round_id=None):
     if _log is None:
         return False
-    _log(f"round_{phase}", [{"salt": cache_salt, "round": round_index}])
+    _log(f"round_{phase}", [{"salt": cache_salt, "round": round_index, "round_id": round_id}])
     return True
 
 
@@ -31,13 +31,17 @@ def _request_fields(controller, request_id):
 
 def _key_fields(key):
     identity = key.identity
-    return {
+    fields = {
         "model": identity.model_name,
         "rank": identity.kv_rank,
         "group": identity.object_group_id,
         "salt": identity.cache_salt,
         "hash": identity.chunk_hash.hex(),
     }
+    round_id = key.extra_attributes.get("lmcache.bidaw_round_id")
+    if isinstance(round_id, str) and round_id:
+        fields["round_id"] = round_id
+    return fields
 
 
 def apply_l2_event_probe() -> bool:
@@ -140,6 +144,8 @@ def apply_l2_event_probe() -> bool:
         # The manager reports expired staging reservations via a separate path.
         if context is not None and context[0] is self:
             log_keys("l1_evict", keys, {"policy": context[1]})
+        elif keys:
+            log_keys("l1_remove", keys, {})
 
     def l2_action(self, adapter, action):
         token = l2_evicting.set(True)
@@ -174,7 +180,7 @@ def apply_l2_event_probe() -> bool:
             log_keys("l2_hit", pc._gather_keys(request.key_groups, result.l2_hit_cells), fields)
         return publish_result(self, request, result)
 
-    log("probe_on", [{"version": 3}])
+    log("probe_on", [{"version": 4}])
     FSL2Adapter._notify_keys_stored = stored
     FSL2Adapter._notify_keys_accessed = accessed
     FSL2Adapter._execute_load = load

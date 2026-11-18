@@ -19,6 +19,7 @@ class Write:
     size: int
     salt: str
     round_index: int | None
+    padded: bool
     evicted_at: int = -1
     eviction_policy: str | None = None
     read_attempt: bool = False
@@ -32,6 +33,13 @@ class Write:
     unknown_lookup: bool = False
 
 
+@dataclass(frozen=True)
+class ReplayRound:
+    salt: str
+    number: int
+    started_at: int
+
+
 def latest_run(path):
     """Return the marker and events for the most recent probe run."""
     with path.open(encoding="utf-8") as stream:
@@ -43,8 +51,8 @@ def latest_run(path):
                     marker = record
                     start = stream.tell()
 
-        if marker is None or marker.get("version") != 3:
-            raise ValueError("A version 3 probe log is required. Record a new run with the updated probe.")
+        if marker is None or marker.get("version") not in (3, 4):
+            raise ValueError("A version 3 or 4 probe log is required. Record a new run with the updated probe.")
 
         stream.seek(start)
         events = []
@@ -63,49 +71,59 @@ def object_key(event):
 def replay_rounds(events):
     """Associate events with replay rounds and validate session-end evidence."""
     rounds = {}
-    starts = {}
-    open_rounds = set()
+    last_round = {}
+    open_rounds = {}
     ended = {}
     invalid = set()
-    finished = set()
+    finished_at = {}
     round_at = {}
     for index, event in enumerate(events):
         kind = event["ev"]
         if kind not in {"round_start", "round_finish", "round_session_end", "write", "lookup"}:
             continue
         salt = event["salt"]
-        current_round = rounds.get(salt)
+        round_id = event.get("round_id")
+        if not round_id:
+            continue
         if kind == "round_start":
             number = event["round"]
+            existing = rounds.get(round_id)
+            if existing is not None:
+                invalid.update((salt, existing.salt))
             if salt in ended or salt in open_rounds or (
-                current_round is not None and number <= current_round
+                salt in last_round and number <= rounds[last_round[salt]].number
             ):
                 invalid.add(salt)
-            rounds[salt] = number
-            starts[salt] = index
-            open_rounds.add(salt)
-        elif kind == "round_finish":
-            if salt not in open_rounds or current_round != event["round"]:
+            rounds[round_id] = ReplayRound(salt, number, index)
+            last_round[salt] = open_rounds[salt] = round_id
+            continue
+
+        scope = rounds.get(round_id)
+        if kind in {"write", "lookup"}:
+            if (scope is not None and scope.salt == salt
+                    and (kind == "write" or open_rounds.get(salt) == round_id)):
+                round_at[index] = (round_id, scope)
+            continue
+        if scope is None or scope.salt != salt or scope.number != event["round"]:
+            invalid.add(salt)
+            continue
+        if kind == "round_finish":
+            if open_rounds.get(salt) != round_id:
                 invalid.add(salt)
             else:
-                open_rounds.remove(salt)
-                finished.add((salt, current_round))
-        elif kind == "round_session_end":
-            if salt in open_rounds or current_round != event["round"] or (
-                salt, current_round
-            ) not in finished:
-                invalid.add(salt)
-            else:
-                ended[salt] = current_round
-        elif current_round is not None and (kind == "write" or salt in open_rounds):
-            round_at[index] = (current_round, starts[salt])
-    return round_at, ended, invalid
+                del open_rounds[salt]
+                finished_at[round_id] = index
+        elif salt in open_rounds or last_round.get(salt) != round_id or round_id not in finished_at:
+            invalid.add(salt)
+        else:
+            ended[salt] = scope.number
+    return round_at, ended, invalid, finished_at
 
 
 def classify(events):
     # Submission events may be written after a fast-lane result.
     events = sorted(events, key=lambda event: event["t_ns"])
-    round_at, ended, invalid = replay_rounds(events)
+    round_at, ended, invalid, finished_at = replay_rounds(events)
     l1_hits = set()
     l2_hits = {}
     preparing = {}
@@ -128,7 +146,7 @@ def classify(events):
 
     for index, event in enumerate(events):
         kind = event["ev"]
-        if kind not in {"write", "lookup", "l1_evict", "load_attempt", "load", "delete"}:
+        if kind not in {"write", "lookup", "l1_evict", "l1_remove", "load_attempt", "load", "delete"}:
             continue
         key = object_key(event)
         copies = active[key] if kind == "write" else active.get(key, {})
@@ -136,19 +154,24 @@ def classify(events):
             request_key = (key, event["request"])
             context = round_at.get(index)
             if context is not None and copies:
-                lookups.setdefault(request_key, (index, context[1]))
+                lookups.setdefault(request_key, (index, *context))
             for write in copies.values():
                 if context is None or write.round_index is None:
                     write.unknown_lookup = True
-                elif context[0] > write.round_index:
+                elif context[1].number > write.round_index:
                     write.lookups.add(request_key)
         elif kind == "l1_evict":
             for write in copies.values():
                 write.evicted_at = index
                 write.eviction_policy = event["policy"]
+        elif kind == "l1_remove":
+            for write in copies.values():
+                write.evicted_at = -1
+                write.eviction_policy = None
         elif kind == "write":
             adapter = event["adapter"]
-            padded_tail_writes += "tail_valid_tokens" in event
+            padded = "tail_valid_tokens" in event
+            padded_tail_writes += padded
             location = (key, adapter)
             rewrites += location in seen
             seen.add(location)
@@ -157,7 +180,7 @@ def classify(events):
                 previous.closed = True
                 previous.pending_reads.clear()
             context = round_at.get(index)
-            write = Write(event["bytes"], event["salt"], context[0] if context else None)
+            write = Write(event["bytes"], event["salt"], context[1].number if context else None, padded)
             copies[adapter] = write
             writes.append(write)
         elif kind in {"load_attempt", "load"}:
@@ -180,11 +203,12 @@ def classify(events):
             if request is not None:
                 write.load_requests.add(request)
             request_key = (key, request)
-            if request_key in write.lookups and write.eviction_policy == "bidaw_eviction_policy":
-                submitted, round_start = lookups[request_key]
-                if (0 <= write.evicted_at < round_start <= submitted
+            if (not write.padded and request_key in write.lookups
+                    and write.eviction_policy == "bidaw_eviction_policy"):
+                submitted, round_id, scope = lookups[request_key]
+                if (0 <= write.evicted_at < scope.started_at <= submitted
                     < preparing.get(request, -1) < attempt < index
-                    < l2_hits.get(request_key, -1)):
+                    < l2_hits.get(request_key, -1) < finished_at.get(round_id, -1)):
                     write.qualifying_requests.add(request)
         elif kind == "delete":
             deletes += 1
@@ -222,6 +246,9 @@ def classify(events):
         "bytes": byte_counts,
         "physical_writes": len(writes),
         "padded_tail_writes": padded_tail_writes,
+        "writes_without_round_evidence": sum(
+            write.round_index is None or write.salt in invalid for write in writes
+        ),
         "unique": len(seen),
         "rewrite_events": rewrites,
         "load_events": loads,
@@ -243,7 +270,7 @@ def main():
 
     marker, events = latest_run(LOG_DIR / "l2_events.jsonl")
     report = {
-        "report_version": 2,
+        "report_version": 3,
         "probe_version": marker["version"],
         "run_id": marker["run"],
         **classify(events),
@@ -266,9 +293,12 @@ def main():
         f"Distinct prefetch/write pairs with a readback: {report['readback_prefetch_write_pairs']}",
         f"Distinct prefetch/write pairs meeting C: {report['qualifying_prefetch_write_pairs']}",
         f"Completed replay sessions: {report['completed_replay_sessions']}",
+        f"Writes without verified replay round: {report['writes_without_round_evidence']}",
         f"Delete events: {report['delete_events']}",
         "",
     ]
+    if marker["version"] < 4:
+        lines.append("Probe v3 lacks request-level round IDs. Replay with a v4 probe for A/B/C.")
     for key, label in LABELS.items():
         percent = classes[key] / total if total else 0
         lines.append(f"{key} {label}: {classes[key]} writes ({percent:.1%}), "

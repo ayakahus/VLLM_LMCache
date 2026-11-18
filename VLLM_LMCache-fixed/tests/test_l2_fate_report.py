@@ -7,14 +7,19 @@ class ChunkFateTests(unittest.TestCase):
     def setUp(self):
         self.events = []
         self.key = dict(model="m", rank=0, group=0, salt="u", hash="k")
+        self.round_id = None
 
     def event(self, kind, **fields):
-        self.events.append(dict(self.key, t_ns=len(self.events), ev=kind, **fields))
+        self.events.append({
+            **self.key, "t_ns": len(self.events), "ev": kind,
+            "round_id": self.round_id, **fields,
+        })
 
     def write(self, size=7):
         self.event("write", adapter="ssd", bytes=size)
 
     def start(self, number):
+        self.round_id = f"{self.key['salt']}-{number}"
         self.event("round_start", round=number)
 
     def finish(self, number, *, last=False):
@@ -71,20 +76,30 @@ class ChunkFateTests(unittest.TestCase):
         self.events[-2]["eviction"] = False
         self.assertEqual(self.counts()["U"], 1)
 
-    def test_effective_write_requires_linked_preparing_dispatch_and_l2_hit(self):
+    def readback(self, *, lookup_round_id=None, removed_again=False, padded=False):
         self.start(0)
-        self.write()
+        if padded:
+            self.event("write", adapter="ssd", bytes=7340032, tail_valid_tokens=88)
+        else:
+            self.write()
         self.finish(0)
         self.event("l1_evict", policy="bidaw_eviction_policy")
+        if removed_again:
+            self.event("l1_remove")
         self.start(1)
-        self.event("lookup", request="1")
+        self.event("lookup", request="1", round_id=lookup_round_id or self.round_id)
         self.event("preparing", request="1")
         self.event("load_attempt", request="1", adapter="ssd")
         self.event("load", request="1", adapter="ssd")
+
+    def test_effective_write_requires_linked_preparing_dispatch_and_l2_hit(self):
+        self.readback()
         self.assertEqual(self.counts()["U"], 1)
         self.event("l2_hit", request="other")
         self.assertEqual(self.counts()["U"], 1)
         self.event("l2_hit", request="1")
+        self.assertEqual(self.counts()["U"], 1)
+        self.finish(1)
         self.assertEqual(self.counts()["C"], 1)
         self.assertEqual(classify(self.events)["qualifying_prefetch_write_pairs"], 1)
 
@@ -96,6 +111,37 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(result["rewrite_events"], 1)
         self.events[3]["policy"] = "LRU"
         self.assertEqual(self.counts()["U"], 2)
+
+    def test_same_salt_readback_without_matching_round_is_not_c(self):
+        self.readback(lookup_round_id="another-request")
+        self.event("l2_hit", request="1")
+        self.finish(1)
+        report = classify(self.events)
+        self.assertEqual(report["writes_read_back"], 1)
+        self.assertEqual(report["classes"], dict(A=0, B=0, C=0, U=1))
+
+    def test_later_non_policy_removal_invalidates_old_bidaw_eviction(self):
+        self.readback(removed_again=True)
+        self.event("l2_hit", request="1")
+        self.finish(1)
+        self.assertEqual(self.counts(), dict(A=0, B=0, C=0, U=1))
+
+    def test_padded_write_is_not_c_in_normal_replay(self):
+        self.readback(padded=True)
+        self.event("l2_hit", request="1")
+        self.finish(1)
+        self.assertEqual(self.counts(), dict(A=0, B=0, C=0, U=1))
+
+    def test_legacy_log_cannot_claim_a_b_or_c_from_timestamps_alone(self):
+        self.readback()
+        self.event("l2_hit", request="1")
+        self.finish(1, last=True)
+        for event in self.events:
+            event.pop("round_id")
+        report = classify(self.events)
+        self.assertEqual(report["writes_read_back"], 1)
+        self.assertEqual(report["writes_without_round_evidence"], 1)
+        self.assertEqual(report["classes"], dict(A=0, B=0, C=0, U=1))
 
     def test_load_frequency_counts_only_matched_write_lifecycles(self):
         self.start(0)

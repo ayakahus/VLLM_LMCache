@@ -20,6 +20,7 @@ import random
 import re
 import time
 from pathlib import Path
+from uuid import uuid4
 
 DEMO_DIR = Path(__file__).resolve().parents[1]
 MODEL_NAME = 'qwen2.5-1.5b-instruct'
@@ -95,12 +96,15 @@ def build_schedule(users, picked, tokenizer, args):
     return schedules, digest.hexdigest(), truncated
 
 
-def stream_ttft(base, prompt, salt, max_tokens, model):
+def stream_ttft(base, prompt, salt, max_tokens, model, *, round_id=None):
     import requests
     payload = dict(model=model, prompt=prompt, max_tokens=max_tokens,
                    temperature=0.0, ignore_eos=True, stream=True,
                    add_special_tokens=False, return_token_ids=True,
                    stream_options={'include_usage': True}, cache_salt=salt)
+    if round_id is not None:
+        # LMCache forwards lmcache.* request metadata apart from cache identity.
+        payload['kv_transfer_params'] = {'lmcache.bidaw_round_id': round_id}
     started, first, usage = time.perf_counter(), None, None
     chunks = []
     completion_ids = []
@@ -157,10 +161,11 @@ def report_answer(lmc, salt, answer_tokens):
     return response.json().get('policies_updated', 0)
 
 
-def report_fate_round(lmc, salt, round_index, phase):
+def report_fate_round(lmc, salt, round_index, phase, round_id):
     import requests
     response = requests.post(f'{lmc}/bidaw/fate/round',
-        json=dict(cache_salt=salt, round_index=round_index, phase=phase), timeout=10)
+        json=dict(cache_salt=salt, round_index=round_index, phase=phase, round_id=round_id),
+        timeout=10)
     response.raise_for_status()
 
 
@@ -238,13 +243,17 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                     records.append(record)
                     continue
                 try:
+                    sender_options = {}
                     if track_fates:
-                        await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'start')
+                        round_id = uuid4().hex
+                        sender_options['round_id'] = round_id
+                        await asyncio.to_thread(report_fate_round, args['lmc'], salt,
+                                                row['rnd'], 'start', round_id)
                     prompt = history + row['query_token_ids']
                     record['sent_s'] = time.perf_counter() - epoch
                     record['scheduling_lag_ms'] = 1000 * (record['sent_s'] - row['due'])
                     result = await asyncio.to_thread(sender, args['vllm'], prompt,
-                        salt, row['rlen'], args['model'])
+                        salt, row['rlen'], args['model'], **sender_options)
                     # Capture network completion before the reporting HTTP call.
                     record['completed_s'] = time.perf_counter() - epoch
                     history = prompt + result['completion_token_ids']
@@ -259,9 +268,11 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                         if args.get('require_answer_policy') and updated < 1:
                             raise RuntimeError('No Bidaw policy received the answer signal')
                     if track_fates:
-                        await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'finish')
+                        await asyncio.to_thread(report_fate_round, args['lmc'], salt,
+                                                row['rnd'], 'finish', round_id)
                         if complete and row is rows[-1]:
-                            await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'session_end')
+                            await asyncio.to_thread(report_fate_round, args['lmc'], salt,
+                                                    row['rnd'], 'session_end', round_id)
                     record['prompt_sha256'] = hashlib.sha256(
                         json.dumps(prompt, separators=(',', ':')).encode()
                     ).hexdigest()
