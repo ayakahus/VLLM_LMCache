@@ -54,8 +54,8 @@ python3 -m unittest discover -s tests -v
 python3 -m unittest discover -s tests -v
 ```
 
-再使用现有虚拟环境启动单臂。以下 reset 命令会停止本 demo 服务并删除
-`l2_ssd/*.data`，用于建立干净的实验状态：
+再使用现有虚拟环境启动单臂。以下 reset 命令会停止本 demo 服务并清理当前尾块模式
+对应的 SSD 缓存目录，用于建立干净的实验状态：
 
 ```bash
 source env.sh
@@ -97,9 +97,9 @@ python3 bidaw/repro_report.py
   论文的 GPU 就绪队列顺序。应进一步采集 vLLM 的请求准入和 GPU 开始计算时间。
 - 负载的时间和长度来自轨迹，查询内容为合成 token，历史回答来自实际生成。
   该设置可用于验证 decode KV 的跨轮复用。实际命中取决于连接器已保存的完整 KV 块。
-- 当前只适用于同模型、同大小 BF16 chunk 的实验。默认 Qwen2.5-1.5B、256 token
-  chunk 为 7,340,032 bytes；切换模型/dtype/chunk/并行度时，显式修改
-  BIDAW_CHUNK_BYTES 或 BIDAW_L1_CAPACITY_KEYS。不同大小对象需要字节加权扩展。
+- 当前只适用于同模型、同大小 BF16 chunk 的实验。Qwen2.5-1.5B 的 256-token
+  chunk 占 7,340,032 bytes，补齐的尾块占用相同容量。其他模型或并行度需要验证布局，
+  并显式指定 `BIDAW_CHUNK_BYTES` 或 `BIDAW_L1_CAPACITY_KEYS`。
 - ghost 采用有限历史窗口，边缘处未来信息不完整；极端区间阈值仍是
   BIDAW_EXTREME_MULT×capacity 的可配置启发式，不是论文阈值的严格复现。
   未观测到的潜力桶使用先验值，应结合 ghost 状态解释结果。
@@ -108,6 +108,24 @@ python3 bidaw/repro_report.py
   做跨 spec 去重。本配置关闭 vLLM 前缀缓存，不评估 GPU 命中前缀漏采的情况。
 - 未实现 SSD 满容量管理的新算法；沿用 LMCache 原有 L2 配置。
 - 不承诺加速比。修复前 README 的历史结果不能作为修复版的性能证据。
+
+## 256-token 尾块填充落盘
+
+默认 `BIDAW_PAD_TAIL=1`。LMCache 保持 256 tokens/chunk，vLLM 的物理页为 16 tokens。
+请求正常结束时，将已计算的非空尾部补零到 256 tokens，使用独立的填充键提交一个
+STORE，随后通过常规 L1 → L2 路径落盘。600 个已计算 tokens 对应两个完整 chunk
+和一个包含 88 个有效 tokens 的尾块。恰好对齐时没有额外尾块。
+
+此模式针对本文的单组全注意力 CUDA 模型和 LMCache 驱动的传输。尾部填充只进入存储，
+普通推理输入保持原样。常规 MP 查找只匹配完整的真实前缀，补齐尾块通过事件探针单独
+计数，实际跨轮复用仍来自已匹配的完整块。尾块传输需要等待当前 CUDA 拷贝完成后清零，
+因此会产生额外的传输和存储开销。
+
+- 默认 L2 目录为 `l2_ssd/padded-tail/`。
+- 对 vLLM 和 LMCache 同时设置 `BIDAW_PAD_TAIL=0` 可恢复只保存完整块的配置，
+  使用原 `l2_ssd/` 目录。切换时一起重启两个服务。
+- 启用 L2 事件探针后，报告中的 `padded_tail_writes` 是确认成功落盘的尾块数，
+  已包含在 `physical_writes` 中。
 
 ## SSD 写入分类（A / B / C / U）
 
@@ -129,5 +147,9 @@ python3 bidaw/l2_fate_report.py
 - B 要求显式的完整会话结束标记、该写入之后的 L1 淘汰和随后确认的 SSD 淘汰，且没有下一轮或 SSD 读取尝试。
 - C 要求该写入之后发生 Bidaw L1 淘汰，后续轮次的同一次预取经双队列的等待路径派发，FS 确认读回，且该块在预取结果中计为 L2 命中。
 - U 包括证据不完整的写入。因上下文上限截断、预热跳过或请求失败，回放不会为该会话发送完整结束标记。
+
+报告列出探针版本和运行 ID。读回强度使用可匹配到本次写入生命周期的成功读回次数，
+并单列其中涉及的不同「预取请求、写入」组合及满足 C 的组合。后端成功读回是 FS 层
+观测，实际设备 I/O 还受操作系统页缓存和 FS 打开方式影响。
 
 默认 FS L2 配置不提供基于容量的全局淘汰。实验若没有实际 SSD 淘汰事件，不能据此估计 B 类的真实占比。

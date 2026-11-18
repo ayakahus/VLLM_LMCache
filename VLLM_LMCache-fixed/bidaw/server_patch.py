@@ -130,6 +130,10 @@ def _patch_l2_event_probe() -> None:
 
 
 def apply_all() -> None:
+    if os.environ.get("BIDAW_PAD_TAIL") == "1":
+        from bidaw.padded_tail import apply_padded_tail_store
+
+        apply_padded_tail_store()
     _patch_factory()
     _patch_http()
     _patch_dual_queue()

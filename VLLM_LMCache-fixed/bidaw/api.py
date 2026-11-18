@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 # First Party
-from bidaw import policy_registry
+from bidaw import padded_tail, policy_registry
 from bidaw.l2_event_probe import record_round
 
 router = APIRouter(tags=["bidaw"])
@@ -51,6 +51,7 @@ def report_fate_round(body: FateRound) -> dict[str, bool]:
 @router.get("/bidaw/status")
 def bidaw_status() -> dict[str, Any]:
     status = policy_registry.snapshot_status()
+    status["padded_tail_store"] = padded_tail.PADDED_TAIL_STORE_ENABLED
     # Scheduler section appears only when the dual-queue patch is enabled.
     try:
         from bidaw.dual_queue_scheduler import scheduler_snapshot

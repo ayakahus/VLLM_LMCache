@@ -8,6 +8,8 @@ from contextvars import ContextVar
 from pathlib import Path
 from uuid import uuid4
 
+from bidaw.padded_tail import TAIL_VALID_TOKENS
+
 _log = None
 
 
@@ -60,6 +62,7 @@ def apply_l2_event_probe() -> bool:
     lock = threading.Lock()
     run = uuid4().hex
     load_request = ContextVar("bidaw_load_request", default={})
+    load_task = ContextVar("bidaw_load_task", default=None)
     l1_evicting = ContextVar("bidaw_l1_evicting", default=None)
     l2_evicting = ContextVar("bidaw_l2_evicting", default=False)
 
@@ -87,19 +90,35 @@ def apply_l2_event_probe() -> bool:
     l1_deleted = BaseL1Manager._free_and_report_deleted
 
     def stored(self, keys, sizes):
-        log("write", (
-            {**_key_fields(key), "adapter": str(self._base_path), "bytes": size}
-            for key, size in zip(keys, sizes, strict=True)
-        ))
+        def write_records():
+            for key, size in zip(keys, sizes, strict=True):
+                fields = {**_key_fields(key), "adapter": str(self._base_path), "bytes": size}
+                valid = key.extra_attributes.get(TAIL_VALID_TOKENS)
+                if valid is not None:
+                    fields["tail_valid_tokens"] = valid
+                yield fields
+
+        log("write", write_records())
         return notify_stored(self, keys, sizes)
 
+    def load_fields(adapter):
+        fields = {"adapter": str(adapter._base_path), **load_request.get()}
+        task = load_task.get()
+        if task is not None:
+            fields["io_task"] = task
+        return fields
+
     def accessed(self, keys):
-        log_keys("load", keys, {"adapter": str(self._base_path), **load_request.get()})
+        log_keys("load", keys, load_fields(self))
         return notify_accessed(self, keys)
 
     async def load(self, keys, objects, task_id):
-        log_keys("load_attempt", keys, {"adapter": str(self._base_path), **load_request.get()})
-        return await execute_load(self, keys, objects, task_id)
+        token = load_task.set(f"{id(self)}:{task_id}")
+        try:
+            log_keys("load_attempt", keys, load_fields(self))
+            return await execute_load(self, keys, objects, task_id)
+        finally:
+            load_task.reset(token)
 
     async def delete(self, keys):
         removed_keys, sizes = await execute_delete(self, keys)

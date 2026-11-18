@@ -25,6 +25,17 @@ class ChunkFateTests(unittest.TestCase):
     def counts(self):
         return classify(self.events)["classes"]
 
+    def test_padded_tail_is_included_once_at_full_physical_size(self):
+        self.start(0)
+        self.write(size=7340032)
+        self.key = dict(self.key, hash="padded")
+        self.event("write", adapter="ssd", bytes=7340032, tail_valid_tokens=88)
+        self.finish(0, last=True)
+        report = classify(self.events)
+        self.assertEqual(report["physical_writes"], 2)
+        self.assertEqual(report["padded_tail_writes"], 1)
+        self.assertEqual(sum(report["bytes"].values()), 2 * 7340032)
+
     def test_all_later_lookups_must_hit_l1_and_never_attempt_ssd(self):
         self.start(0)
         self.write()
@@ -75,6 +86,7 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(self.counts()["U"], 1)
         self.event("l2_hit", request="1")
         self.assertEqual(self.counts()["C"], 1)
+        self.assertEqual(classify(self.events)["qualifying_prefetch_write_pairs"], 1)
 
         self.event("delete", adapter="ssd", eviction=False)
         self.write(size=11)
@@ -84,3 +96,36 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(result["rewrite_events"], 1)
         self.events[3]["policy"] = "LRU"
         self.assertEqual(self.counts()["U"], 2)
+
+    def test_load_frequency_counts_only_matched_write_lifecycles(self):
+        self.start(0)
+        self.event("load_attempt", request="old", adapter="ssd", io_task="0")
+        self.event("load", request="old", adapter="ssd", io_task="0")
+        self.write()
+        for task in ("1", "2"):
+            self.event("load_attempt", request="same-prefetch", adapter="ssd", io_task=task)
+            self.event("load", request="same-prefetch", adapter="ssd", io_task=task)
+        self.finish(0, last=True)
+
+        report = classify(self.events)
+        self.assertEqual(report["classes"], dict(A=0, B=0, C=0, U=1))
+        self.assertEqual(report["load_events"], 3)
+        self.assertEqual(report["attributed_load_events"], 2)
+        self.assertEqual(report["unattributed_load_events"], 1)
+        self.assertEqual(report["writes_read_back"], 1)
+        self.assertEqual(report["readback_prefetch_write_pairs"], 1)
+        self.assertEqual(report["qualifying_prefetch_write_pairs"], 0)
+
+    def test_load_finishing_after_rewrite_is_unattributed(self):
+        self.start(0)
+        self.write()
+        self.event("load_attempt", request="r", adapter="ssd", io_task="before")
+        self.event("delete", adapter="ssd", eviction=False)
+        self.write()
+        self.event("load_attempt", request="r", adapter="ssd", io_task="after")
+        self.event("load", request="r", adapter="ssd", io_task="before")
+
+        report = classify(self.events)
+        self.assertEqual(report["load_events"], 1)
+        self.assertEqual(report["unattributed_load_events"], 1)
+        self.assertEqual(report["writes_read_back"], 0)

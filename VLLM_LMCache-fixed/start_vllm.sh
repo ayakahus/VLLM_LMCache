@@ -22,6 +22,8 @@ set -euo pipefail
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${DEMO_DIR}/env.sh"
+# shellcheck disable=SC1091
+source "${DEMO_DIR}/lmcache_geometry.sh"
 
 MODEL_DIR="${DEMO_DIR}/models/Qwen2.5-1.5B-Instruct"
 PORT="${VLLM_PORT:-8000}"
@@ -29,20 +31,26 @@ PORT="${VLLM_PORT:-8000}"
 mkdir -p "${DEMO_DIR}/logs"
 
 # 论文基线: vLLM 不挂任何 KV 缓存 (全部历史重算)。设 VLLM_WITHOUT_LMCACHE=1 启用。
-# 注意: JSON 不能含空格 (无引号展开会被 word-split)。
-KV_ARGS=''
-if [ "${VLLM_WITHOUT_LMCACHE:-0}" != "1" ]; then
-  KV_ARGS="--kv-transfer-config {\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"lmcache.mp.server_urls\":\"tcp://localhost:5555\",\"lmcache.mp.save_decode_cache\":true}}"
+KV_ARGS=()
+if [[ "${VLLM_WITHOUT_LMCACHE:-0}" != "1" ]]; then
+    CONNECTOR_CONFIG='{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true}}'
+    if [[ "$BIDAW_PAD_TAIL" == "1" ]]; then
+        # The scheduler checks this LMCache instance supports padded writes.
+        export PYTHONPATH="${DEMO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+        CONNECTOR_CONFIG='{"kv_connector":"BidawPaddedTailConnector","kv_connector_module_path":"bidaw.padded_tail_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true,"lmcache.mp.mp_transfer_mode":"lmcache_driven"}}'
+    fi
+    KV_ARGS=(--kv-transfer-config "$CONNECTOR_CONFIG")
 fi
 
-echo "[start_vllm] serving ${MODEL_DIR} on port ${PORT} (GPU=${CUDA_VISIBLE_DEVICES:-1} lmcache=$([ -n "$KV_ARGS" ] && echo on || echo OFF))"
+echo "[start_vllm] serving ${MODEL_DIR} on port ${PORT} (GPU=${CUDA_VISIBLE_DEVICES:-1} lmcache=$([[ ${#KV_ARGS[@]} -gt 0 ]] && echo on || echo OFF))"
 
 exec vllm serve "${MODEL_DIR}" \
     --served-model-name qwen2.5-1.5b-instruct \
     --host 0.0.0.0 \
     --port "${PORT}" \
     --dtype bfloat16 \
+    --block-size 16 \
     --max-model-len 6144 \
     --gpu-memory-utilization 0.30 \
     --disable-prefix-caching \
-    ${KV_ARGS}
+    "${KV_ARGS[@]}"
