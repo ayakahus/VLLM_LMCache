@@ -106,3 +106,26 @@ python3 bidaw/repro_report.py
   做跨 spec 去重。本配置关闭 vLLM 前缀缓存，不评估 GPU 命中前缀漏采的情况。
 - 未实现 SSD 满容量管理的新算法；沿用 LMCache 原有 L2 配置。
 - 不承诺加速比。修复前 README 的历史结果不能作为修复版的性能证据。
+
+## SSD 写入分类（A / B / C / U）
+
+从本目录用以下命令启动 **Bidaw + DQ** 的 LMCache 服务。启动 vLLM 并确认两个服务健康后，再运行回放和报告：
+
+```bash
+BIDAW_L2_EVENT_LOG="$PWD/logs/l2_events.jsonl" EVICTION_POLICY=Bidaw BIDAW_DUAL_QUEUE=1 bash start_lmcache_server.sh
+```
+
+```bash
+source env.sh
+python3 bidaw/trace_replay.py --users 70 --track-chunk-fates --require-answer-policy
+python3 bidaw/l2_fate_report.py
+```
+
+报告读取最近一次 LMCache 启动产生的第 3 版日志，按成功的物理写入计数。每次实验使用独立的服务运行和会话 salt。统计范围是该次服务运行期间记录的写入，包含预热。带标记的回放会增加 HTTP 和日志 I/O 开销。
+
+- A 要求至少一次后续轮次查询该块，写入存续期间所有已知的后续查询均命中 L1，且无 SSD 读取尝试。通过会话结束或该次写入结束确定观测范围。
+- B 要求显式的完整会话结束标记、该写入之后的 L1 淘汰和随后确认的 SSD 淘汰，且没有下一轮或 SSD 读取尝试。
+- C 要求该写入之后发生 Bidaw L1 淘汰，后续轮次的同一次预取经双队列的等待路径派发，FS 确认读回，且该块在预取结果中计为 L2 命中。
+- U 包括证据不完整的写入。因上下文上限截断、预热跳过或请求失败，回放不会为该会话发送完整结束标记。
+
+默认 FS L2 配置不提供基于容量的全局淘汰。实验若没有实际 SSD 淘汰事件，不能据此估计 B 类的真实占比。

@@ -44,6 +44,7 @@ def _num_keys(spec):
 def apply_dual_queue_patch():
     from lmcache.v1.distributed.storage_controllers import prefetch_controller as pc
     from bidaw import policy_registry
+    from bidaw.l2_event_probe import record_preparing_dispatch
 
     cls = pc.PrefetchController
     if getattr(cls, '_bidaw_access_patch', False):
@@ -119,6 +120,7 @@ def apply_dual_queue_patch():
                 STATS.max_wait_s = max(STATS.max_wait_s, now - enqueued)
                 STATS.last_dispatch_ratio = best_r
             try:
+                record_preparing_dispatch(self, rid)
                 self._start_lookup_phase(rid, spec)
             except Exception:
                 pc.logger.exception('Failed starting prefetch request %d', rid)

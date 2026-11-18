@@ -157,6 +157,13 @@ def report_answer(lmc, salt, answer_tokens):
     return response.json().get('policies_updated', 0)
 
 
+def report_fate_round(lmc, salt, round_index, phase):
+    import requests
+    response = requests.post(f'{lmc}/bidaw/fate/round',
+        json=dict(cache_salt=salt, round_index=round_index, phase=phase), timeout=10)
+    response.raise_for_status()
+
+
 def metrics_snapshot(lmc):
     import requests
     response = requests.get(f'{lmc}/metrics', timeout=15)
@@ -202,6 +209,8 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
     async def replay_user(uid, rows):
         salt = f"{args['salt_prefix']}-{uid}"
         previous_failed = False
+        track_fates = args.get('track_chunk_fates') and not args.get('no_cache')
+        complete = bool(rows) and uid not in args.get('truncated_fate_users', ())
         for row in rows:
             phase = 'warmup' if row['due'] < warmup else 'measure'
             record = dict(user=salt, round=row['rnd'], ts=row['ts'],
@@ -222,17 +231,21 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
             # skipped round does not change any later round's prompt bytes.
             # The chain still breaks on real request failures below.
             elif time.perf_counter() >= epoch + warmup:
+                complete = False
                 record['error'] = 'warmup_overrun'
                 records.append(record)
                 continue
             async with sem:
                 if phase == 'warmup' and time.perf_counter() >= epoch + warmup:
+                    complete = False
                     record['error'] = 'warmup_overrun'
                     records.append(record)
                     continue
-                record['sent_s'] = time.perf_counter() - epoch
-                record['scheduling_lag_ms'] = 1000 * (record['sent_s'] - row['due'])
                 try:
+                    if track_fates:
+                        await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'start')
+                    record['sent_s'] = time.perf_counter() - epoch
+                    record['scheduling_lag_ms'] = 1000 * (record['sent_s'] - row['due'])
                     result = await asyncio.to_thread(sender, args['vllm'], row['prompt'],
                         salt, row['rlen'], args['model'])
                     # Capture network completion before the reporting HTTP call.
@@ -247,6 +260,10 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                         record['answer_policies_updated'] = updated
                         if args.get('require_answer_policy') and updated < 1:
                             raise RuntimeError('No Bidaw policy received the answer signal')
+                    if track_fates:
+                        await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'finish')
+                        if complete and row is rows[-1]:
+                            await asyncio.to_thread(report_fate_round, args['lmc'], salt, row['rnd'], 'session_end')
                 except Exception as exc:
                     record['error'] = str(exc)
                     previous_failed = True
@@ -289,7 +306,11 @@ def main():
     ap.add_argument('--no-cache', action='store_true')
     ap.add_argument('--require-answer-policy', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--track-chunk-fates', action='store_true',
+                    help='Send round markers to an LMCache server with BIDAW_L2_EVENT_LOG enabled')
     args = vars(ap.parse_args())
+    if args['track_chunk_fates'] and args['no_cache']:
+        ap.error('--track-chunk-fates requires LMCache')
     if args['warmup_pass']:
         ap.error('--warmup-pass reuses future data; replace with --warmup-seconds 30')
     if args['speed'] <= 0 or args['parallel'] < 1 or args['warmup_seconds'] < 0:
@@ -320,6 +341,8 @@ def main():
         urls.append(f"{args['lmc']}/healthcheck")
     for url in urls:
         requests.get(url, timeout=10).raise_for_status()
+    if args['track_chunk_fates']:
+        args['truncated_fate_users'] = [entry['user'] for entry in truncated]
     records, before, after, wall = asyncio.run(execute_schedule(schedules, args))
     delta = {k: after.get(k, 0) - before.get(k, 0) for k in set(before) | set(after)}
     measured = [r for r in records if r['phase'] == 'measure' and 'error' not in r]

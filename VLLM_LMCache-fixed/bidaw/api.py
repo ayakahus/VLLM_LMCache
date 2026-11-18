@@ -11,14 +11,15 @@ cache bucket hit rates, lower-bound curve).
 """
 
 # Standard
-from typing import Any
+from typing import Any, Literal
 
 # Third Party
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 # First Party
 from bidaw import policy_registry
+from bidaw.l2_event_probe import record_round
 
 router = APIRouter(tags=["bidaw"])
 
@@ -32,6 +33,19 @@ class AnswerReport(BaseModel):
 def report_answer(body: AnswerReport) -> dict[str, Any]:
     fed = policy_registry.feed_answer(body.cache_salt, body.answer_tokens)
     return {"status": "ok", "policies_updated": fed}
+
+
+class FateRound(BaseModel):
+    cache_salt: str = Field(min_length=1)
+    round_index: int = Field(ge=0)
+    phase: Literal["start", "finish", "session_end"]
+
+
+@router.post("/bidaw/fate/round")
+def report_fate_round(body: FateRound) -> dict[str, bool]:
+    if not record_round(body.cache_salt, body.round_index, body.phase):
+        raise HTTPException(status_code=409, detail="L2 event probe is disabled")
+    return {"recorded": True}
 
 
 @router.get("/bidaw/status")

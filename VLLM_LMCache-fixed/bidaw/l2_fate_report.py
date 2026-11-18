@@ -1,167 +1,262 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Classify SSD-written chunks by lifecycle events (Bidaw, paper trace).
-
-Categories over unique physically-written chunks:
-  C  effective  : successfully loaded back from SSD >= 1 time
-                  (backend-confirmed load events, not atime heuristics)
-  A  retained   : never loaded back, but a LATER lookup submission of the
-                  same salt contained this chunk and it was still
-                  L1-resident at observation end (DRAM served the reuse)
-  B  dead write : never loaded back and no later lookup contained it, with
-                  the write outside the end-of-observation horizon
-  U  unresolved : written inside the end-of-observation horizon (next use
-                  unknown), or lookup-contained-but-not-resident anomaly
-  D  duplicates : reported separately at event level --
-                  skip events (duplicate submission, no physical write)
-                  and physical rewrites (only possible after a delete)
-"""
+"""Classify physical FS L2 writes using explicit replay and cache events."""
 import json
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
-FIX = Path(__file__).resolve().parents[1]
-EV_LOG = FIX / "logs" / "l2_events.jsonl"
-METRICS_TXT = FIX / "logs" / "l2class2_metrics.txt"
-STATUS_JSON = FIX / "logs" / "l2class2_status.json"
-OUT_PNG = FIX / "logs" / "ssd_chunk_fate_pie.png"
-OUT_TXT = FIX / "logs" / "ssd_chunk_fate.txt"
-HORIZON = 30.0  # end-of-observation horizon (s), == warmup window
-
-# ---- load lifecycle events ----
-events = []
-with open(EV_LOG) as f:
-    for line in f:
-        line = line.strip()
-        if line:
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-
-per_key = defaultdict(lambda: {"write": 0, "skip": 0, "load": 0,
-                               "delete": 0, "first_w": None, "last_w": None})
-key_submits = defaultdict(list)
-t_end = 0.0
-for e in events:
-    t_end = max(t_end, e["t"])
-    k = (e["salt"], e["hash"])
-    if e["ev"] == "submit":
-        key_submits[k].append(e["t"])
-        continue
-    p = per_key[k]
-    p[e["ev"]] = p.get(e["ev"], 0) + 1
-    if e["ev"] == "write":
-        if p["first_w"] is None:
-            p["first_w"] = e["t"]
-        p["last_w"] = e["t"]
-
-written = {k: p for k, p in per_key.items() if p["write"] >= 1}
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+LABELS = {
+    "A": "All observed later lookups hit DRAM",
+    "B": "Final-round write evicted unread",
+    "C": "Bidaw eviction and preparing-queue readback",
+    "U": "Unresolved",
+}
 
 
-# ---- resident-at-end identities (policy status) ----
-status = json.load(open(STATUS_JSON))
-pol = status["policies"][0]
-resident = {(e["salt"], e["hash"]) for e in pol.get("resident_identities", [])}
+@dataclass
+class Write:
+    size: int
+    salt: str
+    round_index: int | None
+    evicted_at: int = -1
+    bidaw_evicted_at: int = -1
+    read_attempt: bool = False
+    effective: bool = False
+    ssd_evicted: bool = False
+    closed: bool = False
+    lookups: set = field(default_factory=set)
+    unknown_lookup: bool = False
 
-# ---- classify (event-driven) ----
-cls = {"C": 0, "A": 0, "B": 0, "U": 0}
-bytes_cls = {"C": 0, "A": 0, "B": 0, "U": 0}
-anomalies = []
-skip_events = rewrite_events = load_events = delete_events = 0
-CHUNK_BYTES = 7340032  # 256 tokens x 28,672 B (Qwen2.5-1.5B bf16)
-for k, p in written.items():
-    loads = p["load"]
-    writes = p["write"]
-    skip_events += p["skip"]
-    load_events += loads
-    delete_events += p["delete"]
-    if writes >= 2:
-        rewrite_events += writes - 1
-    later_lookup = any(t > p["last_w"] + 0.5 for t in key_submits.get(k, []))
-    if loads >= 1:
-        kk = "C"      # backend-confirmed reuse from SSD
-    elif later_lookup:
-        # A later lookup contained this chunk and no SSD load followed:
-        # the only way the lookup could serve it is an L1 hit, so DRAM
-        # (not SSD) served every later access.  End-of-run residency is
-        # irrelevant (the chunk may be evicted after its last access).
-        kk = "A"
-    elif p["last_w"] >= t_end - HORIZON:
-        kk = "U"                                  # next use not observed yet
-    else:
-        kk = "B"                                  # session ended, never used
-    cls[kk] += 1
-    bytes_cls[kk] += CHUNK_BYTES
-n_unique = len(written)
 
-# ---- metrics cross-check ----
-store_events = hit_l2_tokens = req_tokens = 0
-for line in open(METRICS_TXT):
-    for key, var in (("l2_store_completed_objects_chunks_total", "se"),
-                     ("lookup_hit_l2_tokens_total", "hl2"),
-                     ("lookup_requested_tokens_total", "req")):
-        if line.startswith("lmcache_mp_" + key):
-            try:
-                v = float(line.rsplit(" ", 1)[1])
-            except ValueError:
-                continue
-            if var == "se":
-                store_events += v
-            elif var == "hl2":
-                hit_l2_tokens += v
+def latest_run(path):
+    """Yield events from the most recent probe marker in an append-only log."""
+    with path.open(encoding="utf-8") as stream:
+        marker = None
+        while line := stream.readline():
+            if '"probe_on"' in line:
+                record = json.loads(line)
+                if record.get("ev") == "probe_on":
+                    marker = record
+                    start = stream.tell()
+
+        if marker is None or marker.get("version") != 3:
+            raise ValueError("A version 3 probe log is required. Record a new run with the updated probe.")
+
+        stream.seek(start)
+        for line in stream:
+            if line.strip():
+                event = json.loads(line)
+                if event.get("run") == marker["run"]:
+                    yield event
+
+
+def object_key(event):
+    return tuple(event[field] for field in ("model", "rank", "group", "salt", "hash"))
+
+
+def replay_rounds(events):
+    """Associate events with replay rounds and validate session-end evidence."""
+    rounds = {}
+    starts = {}
+    open_rounds = set()
+    ended = {}
+    invalid = set()
+    finished = set()
+    round_at = {}
+    for index, event in enumerate(events):
+        kind = event["ev"]
+        if kind not in {"round_start", "round_finish", "round_session_end", "write", "lookup"}:
+            continue
+        salt = event["salt"]
+        current_round = rounds.get(salt)
+        if kind == "round_start":
+            number = event["round"]
+            if salt in ended or salt in open_rounds or (
+                current_round is not None and number <= current_round
+            ):
+                invalid.add(salt)
+            rounds[salt] = number
+            starts[salt] = index
+            open_rounds.add(salt)
+        elif kind == "round_finish":
+            if salt not in open_rounds or current_round != event["round"]:
+                invalid.add(salt)
             else:
-                req_tokens += v
+                open_rounds.remove(salt)
+                finished.add((salt, current_round))
+        elif kind == "round_session_end":
+            if salt in open_rounds or current_round != event["round"] or (
+                salt, current_round
+            ) not in finished:
+                invalid.add(salt)
+            else:
+                ended[salt] = current_round
+        elif current_round is not None and (kind == "write" or salt in open_rounds):
+            round_at[index] = (current_round, starts[salt])
+    return round_at, ended, invalid
 
 
-# ---- report + pie ----
-lines = [f"unique physically-written chunks: {n_unique}",
-         f"store key-events (completed, incl. skipped): {int(store_events)}",
-         f"skip events (logical dup submission, no physical write): {skip_events}",
-         f"physical rewrite events: {rewrite_events}",
-         f"backend load events (SSD reads): {load_events}",
-         f"delete events: {delete_events}", ""]
-for kk in ("C", "A", "B", "U"):
-    lines.append(f"{kk}: {cls[kk]:4d} chunks "
-                 f"({100*cls[kk]/max(1, n_unique):.1f}% of unique) "
-                 f"{bytes_cls[kk]/2**30:6.2f} GiB")
-lines.append("")
-lines.append(f"requests served from SSD: {hit_l2_tokens/req_tokens:.1%} "
-             f"({int(hit_l2_tokens)}/{int(req_tokens)} tokens)")
-if anomalies:
-    lines.append(f"anomalies: {len(anomalies)} e.g. {anomalies[:3]}")
+def classify(events):
+    # Submission events may be written after a fast-lane result.
+    events = sorted(events, key=lambda event: event["t_ns"])
+    round_at, ended, invalid = replay_rounds(events)
+    l1_hits = set()
+    l2_hits = {}
+    preparing = {}
+    for index, event in enumerate(events):
+        kind = event["ev"]
+        if kind == "preparing":
+            preparing[event["request"]] = index
+        elif kind == "l1_hit":
+            l1_hits.add((object_key(event), event["request"]))
+        elif kind == "l2_hit":
+            l2_hits[(object_key(event), event["request"])] = index
 
-json.dump({"classes": cls, "bytes": bytes_cls, "unique": n_unique,
-           "skip_events": skip_events, "rewrite_events": rewrite_events,
-           "load_events": load_events, "delete_events": delete_events,
-           "anomalies": anomalies[:20]},
-          open(OUT_TXT.with_suffix(".json"), "w"), indent=1)
+    classes = dict.fromkeys(LABELS, 0)
+    byte_counts = dict.fromkeys(LABELS, 0)
+    active = defaultdict(dict)
+    writes = []
+    seen = set()
+    lookups = {}
+    rewrites = loads = deletes = unattributed_loads = 0
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+    for index, event in enumerate(events):
+        kind = event["ev"]
+        if kind not in {"write", "lookup", "l1_evict", "load_attempt", "load", "delete"}:
+            continue
+        key = object_key(event)
+        copies = active[key] if kind == "write" else active.get(key, {})
+        if kind == "lookup":
+            request_key = (key, event["request"])
+            context = round_at.get(index)
+            if context is not None and copies:
+                lookups.setdefault(request_key, (index, *context))
+            for write in copies.values():
+                if context is None or write.round_index is None:
+                    write.unknown_lookup = True
+                elif context[0] > write.round_index:
+                    write.lookups.add(request_key)
+        elif kind == "l1_evict":
+            for write in copies.values():
+                write.evicted_at = index
+                if event["policy"] == "bidaw_eviction_policy":
+                    write.bidaw_evicted_at = index
+        elif kind == "write":
+            adapter = event["adapter"]
+            location = (key, adapter)
+            rewrites += location in seen
+            seen.add(location)
+            previous = copies.get(adapter)
+            if previous is not None:
+                previous.closed = True
+            context = round_at.get(index)
+            write = Write(event["bytes"], event["salt"], context[0] if context else None)
+            copies[adapter] = write
+            writes.append(write)
+        elif kind in {"load_attempt", "load"}:
+            for write in copies.values():
+                write.read_attempt = True
+            if kind == "load":
+                loads += 1
+                write = copies.get(event["adapter"])
+                if write is None:
+                    unattributed_loads += 1
+                    continue
+                request = event.get("request")
+                request_key = (key, request)
+                lookup = lookups.get(request_key)
+                if lookup and write.round_index is not None:
+                    submitted, number, round_start = lookup
+                    if (number > write.round_index
+                        and 0 <= write.bidaw_evicted_at < round_start <= submitted
+                        < preparing.get(request, -1) < index
+                        < l2_hits.get(request_key, -1)):
+                        write.effective = True
+        elif kind == "delete":
+            deletes += 1
+            write = copies.pop(event["adapter"], None)
+            if write is not None:
+                write.closed = True
+                write.ssd_evicted = event["eviction"]
+                if not copies:
+                    del active[key]
 
-sizes = [cls["C"], cls["A"], cls["B"], cls["U"]]
-labels = [
-    f"C effective (read back)\n{cls['C']} chunks",
-    f"A DRAM-retained redundancy\n{cls['A']} chunks",
-    f"B dead write (no later use)\n{cls['B']} chunks",
-    f"U unresolved (horizon)\n{cls['U']} chunks",
-]
-colors = ["#6aa9e0", "#8fd18f", "#e0b050", "#b9b9b9"]
-fig, ax = plt.subplots(figsize=(8.8, 7.2))
-ax.pie(sizes, labels=labels, colors=colors, startangle=90,
-       autopct=lambda p: f"{p:.1f}%", pctdistance=0.72,
-       wedgeprops=dict(edgecolor="white", linewidth=1.5),
-       textprops=dict(fontsize=11))
-ax.set_title(
-    "Bidaw SSD chunk-fate classification (official trace, u70=25.6 users/min)\n"
-    f"unique written chunks {n_unique} | logical-dup skips {skip_events} | "
-    f"SSD served {hit_l2_tokens/req_tokens:.1%} of requested tokens",
-    fontsize=12)
-ax.axis("equal")
-fig.savefig(OUT_PNG, dpi=150, bbox_inches="tight")
+    for write in writes:
+        session_ended = write.salt in ended
+        if write.salt in invalid or write.round_index is None:
+            category = "U"
+        elif write.effective:
+            category = "C"
+        elif (not write.read_attempt and not write.unknown_lookup
+              and write.lookups and write.lookups <= l1_hits
+              and (write.closed or session_ended)):
+            category = "A"
+        elif (not write.read_attempt and not write.unknown_lookup
+              and write.ssd_evicted and write.evicted_at >= 0
+              and session_ended and ended[write.salt] == write.round_index):
+            category = "B"
+        else:
+            category = "U"
+        classes[category] += 1
+        byte_counts[category] += write.size
 
-with open(OUT_TXT, "w", encoding="utf-8") as f:
-    f.write("\n".join(lines) + "\n")
-print("written:", OUT_PNG, "and", OUT_TXT)
+    return {
+        "classes": classes,
+        "bytes": byte_counts,
+        "physical_writes": len(writes),
+        "unique": len(seen),
+        "rewrite_events": rewrites,
+        "load_events": loads,
+        "unattributed_load_events": unattributed_loads,
+        "delete_events": deletes,
+    }
+
+
+def main():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    report = classify(latest_run(LOG_DIR / "l2_events.jsonl"))
+    total = report["physical_writes"]
+    classes = report["classes"]
+    lines = [
+        f"Confirmed physical writes: {total}",
+        f"Unique L2 locations written: {report['unique']}",
+        f"Physical rewrites: {report['rewrite_events']}",
+        f"Backend load events: {report['load_events']}",
+        f"Loads with no matching write in this run: {report['unattributed_load_events']}",
+        f"Delete events: {report['delete_events']}",
+        "",
+    ]
+    for key, label in LABELS.items():
+        percent = classes[key] / total if total else 0
+        lines.append(f"{key} {label}: {classes[key]} writes ({percent:.1%}), "
+                     f"{report['bytes'][key] / 2**30:.2f} GiB")
+
+    output = LOG_DIR / "ssd_chunk_fate"
+    output.with_suffix(".txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    fig, ax = plt.subplots(figsize=(8.8, 7.2))
+    if total:
+        ax.pie(
+            list(classes.values()),
+            labels=[f"{key} {LABELS[key]}\n{classes[key]} writes" for key in LABELS],
+            colors=["#6aa9e0", "#8fd18f", "#e0b050", "#b9b9b9"],
+            startangle=90,
+            autopct="%1.1f%%",
+            pctdistance=0.72,
+            wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+        )
+    else:
+        ax.text(0.5, 0.5, "No confirmed writes in this run", ha="center", va="center")
+        ax.axis("off")
+    ax.set_title(f"Bidaw L2 write fates ({total} confirmed writes)")
+    fig.savefig(LOG_DIR / "ssd_chunk_fate_pie.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+if __name__ == "__main__":
+    main()
