@@ -1,0 +1,17 @@
+# --- 运行时生成/可再生的重资产: 绝不入库 ---
+venv/
+models/
+l2_ssd/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- 原始轨迹下载目录 (冻结快照 trace_frozen 才是实验输入, 已入库) ---
+bidaw/trace/
+
+# ---编辑器/系统---
+.git/
+.vscode/
+*.swp
+.DS_Store
