@@ -28,10 +28,15 @@ class BidawPaddedTailConnector(LMCacheMPConnector):
             raise ValueError("Padded tails require vLLM without speculative decoding")
         if role == KVConnectorRole.SCHEDULER:
             with urlopen("http://127.0.0.1:8080/bidaw/status", timeout=5) as response:
-                enabled = json.load(response).get("padded_tail_store")
-            if enabled is not True:
+                server_status = json.load(response)
+            if server_status.get("padded_tail_store") is not True:
                 raise RuntimeError("Start the LMCache server with BIDAW_PAD_TAIL=1")
         super().__init__(vllm_config, role, kv_cache_config)
+        if role == KVConnectorRole.SCHEDULER:
+            self.bidaw_dual_queue = server_status.get("scheduler", {}).get("enabled") is True
+            if self.bidaw_dual_queue:
+                # Start lookup as soon as the request enters the waiting queue.
+                self._eager_prefetch = True
         adapter = self.scheduler_adapter if role == KVConnectorRole.SCHEDULER else self.worker_adapter
         if (adapter.lmcache_tokens_per_chunk != CHUNK_TOKENS
                 or list(self._group_tokens_per_block) != [BLOCK_TOKENS]

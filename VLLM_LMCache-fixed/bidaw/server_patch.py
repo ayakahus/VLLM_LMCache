@@ -17,6 +17,7 @@ the server boots:
 """
 
 # Standard
+from functools import wraps
 import os
 
 # First Party
@@ -72,6 +73,36 @@ def _patch_http() -> None:
 
     if not any(getattr(r, "path", "").startswith("/bidaw") for r in hs.app.routes):
         hs.app.include_router(router)
+
+
+def _patch_conversation_lookup() -> None:
+    from lmcache.utils import get_size_bytes
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    original = LookupModule.lookup
+
+    @wraps(original)  # preserve the MP handler registration metadata
+    def lookup(self, key, tp_size):
+        if key.cache_salt:
+            ctx = self.context
+            layouts = ctx.layout_desc_registry.find_group_layout_descs(
+                key.model_name, key.world_size
+            )
+            if layouts:
+                history_tokens = (key.request_configs or {}).get("lmcache.bidaw_history_tokens")
+                if type(history_tokens) is not int or not 0 <= history_tokens <= key.num_tokens:
+                    history_tokens = key.num_tokens
+                chunk_bytes = key.world_size * sum(
+                    get_size_bytes(layout.shapes, layout.dtypes) for layout in layouts.values()
+                )
+                policy_registry.feed_conversation(
+                    key.cache_salt,
+                    history_tokens * chunk_bytes // ctx.chunk_size,
+                    key.request_id,
+                )
+        return original(self, key, tp_size)
+
+    LookupModule.lookup = lookup
 
 
 def _patch_dual_queue() -> None:
@@ -136,6 +167,8 @@ def apply_all() -> None:
         apply_padded_tail_store()
     _patch_factory()
     _patch_http()
+    if os.environ.get("BIDAW_FORCE_POLICY") == "Bidaw":
+        _patch_conversation_lookup()
+    _patch_l2_event_probe()
     _patch_dual_queue()
     _patch_watermark()
-    _patch_l2_event_probe()

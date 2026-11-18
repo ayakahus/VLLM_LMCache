@@ -5,6 +5,7 @@
 # - HTTP 管理端口: 8080 (GET /cache/objects, GET /metrics, GET /bidaw/status ...)
 # - L1 缓存: DRAM, 默认 8GB (L1_GB 可覆盖)
 # - L2 缓存: 本地文件系统(SSD), 默认 <demo>/l2_ssd/padded-tail
+# - 从 L2 读回的 chunk 留在 L1，直到被淘汰
 # - 淘汰策略: EVICTION_POLICY 环境变量, 默认 Bidaw
 #     Bidaw  -> 经 bidaw.lmcache_server_entry 注入的策略(上一轮回答长度感知)
 #     LRU/ARC/IsolatedLRU -> LMCache 原生策略(对照组)
@@ -40,4 +41,5 @@ exec python3 -m bidaw.lmcache_server_entry server \
     --chunk-size 256 \
     --l1-size-gb "$L1_GB" \
     --eviction-policy "$EVICTION_POLICY" \
+    --l2-prefetch-policy retain \
     --l2-adapter "{\"type\":\"fs\",\"base_path\":\"$LMCACHE_L2_PATH\"}"

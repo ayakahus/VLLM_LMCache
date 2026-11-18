@@ -33,13 +33,14 @@ mkdir -p "${DEMO_DIR}/logs"
 # 论文基线: vLLM 不挂任何 KV 缓存 (全部历史重算)。设 VLLM_WITHOUT_LMCACHE=1 启用。
 KV_ARGS=()
 if [[ "${VLLM_WITHOUT_LMCACHE:-0}" != "1" ]]; then
+    export PYTHONPATH="${DEMO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
     CONNECTOR_CONFIG='{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true}}'
     if [[ "$BIDAW_PAD_TAIL" == "1" ]]; then
         # The scheduler checks this LMCache instance supports padded writes.
-        export PYTHONPATH="${DEMO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
         CONNECTOR_CONFIG='{"kv_connector":"BidawPaddedTailConnector","kv_connector_module_path":"bidaw.padded_tail_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true,"lmcache.mp.mp_transfer_mode":"lmcache_driven"}}'
     fi
-    KV_ARGS=(--kv-transfer-config "$CONNECTOR_CONFIG")
+    KV_ARGS=(--kv-transfer-config "$CONNECTOR_CONFIG"
+             --scheduler-cls bidaw.vllm_arrival_scheduler.BidawScheduler)
 fi
 
 echo "[start_vllm] serving ${MODEL_DIR} on port ${PORT} (GPU=${CUDA_VISIBLE_DEVICES:-1} lmcache=$([[ ${#KV_ARGS[@]} -gt 0 ]] && echo on || echo OFF))"

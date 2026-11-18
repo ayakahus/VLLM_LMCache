@@ -7,18 +7,15 @@ Bidirectional Computation-Storage Awareness`` (Hu et al., FAST'26):
 
 * Per-user (``cache_salt``) weighted-reuse-distance (WRD) tracking, updated
   from logical lookup submissions, independently of L1 lifecycle events.
-* Online lower-bound curve: the minimum observed WRD per previous-round
-  answer-length bin (paper section 3.3.1, Spearman 0.94-0.98 observation).
-* A background ghost cache that replays the recent access trace through
-  Belady's optimal algorithm to estimate, per WRD bucket, the hit rate an
-  optimal strategy would achieve (paper section 3.3.2/3.3.3).
+* Online lower-bound curve: the minimum inlier WRD per previous-round
+  answer length (paper section 3.3.1, Spearman 0.94-0.98 observation).
+* A byte-budgeted ghost cache that replays recent accesses with known future
+  uses in that window (paper sections 3.3.2 and 3.3.3).
 * Eviction candidates with a salt are selected at user granularity by
   predicted hit potential (paper eq. 2). Unsalted keys are individual
   candidates with neutral potential and LRU ordering.
 
-Units: WRD is tracked in "distinct equal-sized keys" (uniform chunk size makes bytes and
-key counts monotonically equivalent); the small-bucket threshold is the L1
-capacity expressed in keys (``BIDAW_L1_CAPACITY_KEYS``).
+WRD and ghost capacity are measured in bytes.
 """
 
 # Standard
@@ -27,7 +24,7 @@ import math
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 
 from bidaw.reuse_distance import ReuseDistance
 
@@ -41,9 +38,6 @@ from lmcache.v1.distributed.internal_api import (
 )
 
 logger = init_logger(__name__)
-
-_LB_BIN_TOKENS = 32  # answer-length bin width (tokens)
-
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -65,12 +59,14 @@ class BidawEvictionPolicy(EvictionPolicy):
     def __init__(self) -> None:
         # --- configuration (env-overridable) ---
         self._capacity_keys = max(16, _env_int("BIDAW_L1_CAPACITY_KEYS", 560))
+        self._chunk_bytes = max(1, _env_int("BIDAW_CHUNK_BYTES", 7340032))
+        self._capacity_bytes = self._capacity_keys * self._chunk_bytes
         self._ghost_window = max(256, _env_int("BIDAW_GHOST_WINDOW", 8000))
         self._ghost_interval = max(1.0, _env_float("BIDAW_GHOST_INTERVAL", 5.0))
         self._extreme_mult = max(2.0, _env_float("BIDAW_EXTREME_MULT", 6.0))
         self._promising_buckets = max(2, _env_int("BIDAW_PROMISING_BUCKETS", 8))
         self._grace_seconds = max(0.0, _env_float("BIDAW_GRACE_SECONDS", 0.0))
-        self._extreme_threshold = self._capacity_keys * self._extreme_mult
+        self._extreme_threshold = self._capacity_bytes * self._extreme_mult
 
         # --- shared state ---
         self._lock = threading.RLock()
@@ -80,13 +76,14 @@ class BidawEvictionPolicy(EvictionPolicy):
         self._ghost_last_error = None
         self._lb_samples = defaultdict(lambda: deque(maxlen=512))
         self._logical_requests = 0
+        self._recent_lookups: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._tracked: dict[ObjectKey, float] = {}  # key -> last resident touch
         self._salt_last_touch: dict[str, float] = {}  # salt -> monotonic time
         self._salt_hist: dict[str, deque] = defaultdict(
             lambda: deque(maxlen=64)
         )
         self._salt_last_answer: dict[str, int] = {}
-        self._lb_min: dict[int, float] = {}  # answer bin -> min WRD
+        self._lb_min: dict[int, int] = {}  # answer length -> min WRD in bytes
         self._trace: deque = deque(maxlen=self._ghost_window)
         self._ghost = None                   # (small, [prom...], built_at)
         self._ghost_built_seq = 0
@@ -202,7 +199,7 @@ class BidawEvictionPolicy(EvictionPolicy):
                 }
             return {
                 "policy": "Bidaw",
-                "units": "distinct_equal_sized_chunks",
+                "units": "bytes",
                 "logical_requests": self._logical_requests,
                 "history_identities": len(self._reuse.last),
                 "ghost_errors": self._ghost_errors,
@@ -222,6 +219,7 @@ class BidawEvictionPolicy(EvictionPolicy):
                 ],
                 "seq": self._seq,
                 "capacity_keys": self._capacity_keys,
+                "capacity_bytes": self._capacity_bytes,
                 "last_answers": dict(list(self._salt_last_answer.items())[-8:]),
                 "lb_curve": {
                     str(k): round(v, 1)
@@ -233,44 +231,53 @@ class BidawEvictionPolicy(EvictionPolicy):
     # ------------------------------------------------------------------
     # Internal: access recording + WRD / lower-bound accounting
     # ------------------------------------------------------------------
-    def on_request_access(self, keys: list[ObjectKey]) -> None:
-        """One logical prefetch submission, including L1/L2 misses.
-
-        Creation, reload and lock callbacks must not train the predictor.
-        Deduplicate identities within the submitted request only.
-        """
+    def on_conversation_access(
+        self, salt: str, history_bytes: int, request_id: str | None = None
+    ) -> None:
+        """Observe one user round, including rounds with no cacheable chunk."""
         with self._lock:
+            if request_id is not None:
+                identity = salt, request_id
+                if identity in self._recent_lookups:
+                    return
+                self._recent_lookups[identity] = None
+                if len(self._recent_lookups) > self._ghost_window:
+                    self._recent_lookups.popitem(last=False)
             self._logical_requests += 1
-            now = time.monotonic()
-            seen = set()
-            for key in keys:
-                kid = self._key_id(key)
-                if kid in seen:
-                    continue
-                seen.add(kid)
-                salt = key.cache_salt or ""
-                self._seq += 1
-                wrd = self._reuse.access(kid)
-                if salt:
-                    if wrd is not None:
-                        self._record_wrd(salt, float(wrd))
-                    self._salt_last_touch[salt] = now
-                self._trace.append((kid, salt))
+            wrd = self._observe(("conversation", salt), history_bytes)
+            if wrd is not None:
+                self._record_wrd(salt, wrd)
+            self._salt_last_touch[salt] = time.monotonic()
             self._ensure_ghost_thread()
 
-    def _record_wrd(self, salt: str, wrd: float) -> None:
+    def on_request_access(self, objects: dict[ObjectKey, int]) -> None:
+        """Account for shared-prefix traffic without assigning it a user."""
+        if not objects:
+            return
+        with self._lock:
+            self._logical_requests += 1
+            for key, size_bytes in objects.items():
+                self._observe(self._key_id(key), size_bytes)
+            self._ensure_ghost_thread()
+
+    def _observe(self, identity: tuple, size_bytes: int) -> int | None:
+        self._seq += 1
+        self._trace.append((identity, size_bytes))
+        return self._reuse.access(identity, size_bytes)
+
+    def _record_wrd(self, salt: str, wrd: int) -> None:
         self._salt_hist[salt].append(wrd)
-        if salt not in self._salt_last_answer:
-            return  # Unknown previous answer is not a zero-length answer.
-        bin_id = min(self._salt_last_answer[salt] // _LB_BIN_TOKENS, 63)
-        samples = self._lb_samples[bin_id]
+        answer_length = self._salt_last_answer.get(salt)
+        if answer_length is None:
+            return
+        samples = self._lb_samples[answer_length]
         samples.append(wrd)
         if len(samples) < 8:
             return
         ordered = sorted(samples)
         q1, q3 = ordered[len(ordered) // 4], ordered[3 * len(ordered) // 4]
         lower_fence = q1 - 1.5 * (q3 - q1)
-        self._lb_min[bin_id] = next(x for x in ordered if x >= lower_fence)
+        self._lb_min[answer_length] = next(x for x in ordered if x >= lower_fence)
 
     @staticmethod
     def _key_id(key: ObjectKey) -> tuple:
@@ -302,14 +309,12 @@ class BidawEvictionPolicy(EvictionPolicy):
 
     def _rebuild_ghost(self) -> None:
         with self._lock:
-            if self._seq - self._ghost_built_seq < self._ghost_window // 4:
-                return  # not enough new evidence since last rebuild
+            if self._seq == self._ghost_built_seq or len(self._trace) < 64:
+                return
             snapshot = list(self._trace)
             snapshot_seq = self._seq
-        if len(snapshot) < 64:
-            return
 
-        capacity = self._capacity_keys
+        capacity = self._capacity_bytes
         # next-use index for every position within the window
         next_use = [math.inf] * len(snapshot)
         last_seen: dict[tuple, int] = {}
@@ -318,42 +323,37 @@ class BidawEvictionPolicy(EvictionPolicy):
             next_use[i] = last_seen.get(kid, math.inf)
             last_seen[kid] = i
 
-        cache: dict[tuple, int] = {}   # kid -> position pushed
+        cache: dict[tuple, tuple[int, int]] = {}  # identity -> (position, bytes)
+        used_bytes = 0
         heap: list[tuple[float, int, tuple]] = []
         reuse = ReuseDistance(max_keys=len(snapshot))
-        outcomes: list[tuple[float | None, int]] = []
-
-        for i, (kid, _salt) in enumerate(snapshot):
-            wrd_keys = reuse.access(kid)
-            hit = kid in cache
-            outcomes.append((wrd_keys, 1 if hit else 0))
-            if hit:
-                cache[kid] = i
-                heapq.heappush(heap, (-next_use[i], i, kid))
-            else:
-                if len(cache) >= capacity:
-                    while heap:
-                        _neg, pos, k2 = heapq.heappop(heap)
-                        if cache.get(k2) == pos:
-                            del cache[k2]
-                            break
-                cache[kid] = i
-                heapq.heappush(heap, (-next_use[i], i, kid))
-
         small: list[int] = []
         buckets: list[list[int]] = [[] for _ in range(self._promising_buckets)]
-        span = self._extreme_threshold - capacity
-        for wrd, hit in outcomes:
-            if wrd is None:
+
+        for i, (kid, size_bytes) in enumerate(snapshot):
+            wrd = reuse.access(kid, size_bytes)
+            previous = cache.pop(kid, None)
+            if previous is not None:
+                used_bytes -= previous[1]
+            if wrd is not None and size_bytes:
+                kind, idx = self._bucket_of(wrd)
+                # The ghost predicts user residency. It budgets each user's
+                # latest known size as their conversation grows.
+                hit = int(previous is not None and size_bytes <= capacity)
+                if kind == 0:
+                    small.append(hit)
+                elif kind == 1:
+                    buckets[idx].append(hit)
+            if not 0 < size_bytes <= capacity:
                 continue
-            if wrd < capacity:
-                small.append(hit)
-            elif wrd < self._extreme_threshold:
-                idx = min(
-                    int((wrd - capacity) / max(span, 1.0) * len(buckets)),
-                    len(buckets) - 1,
-                )
-                buckets[idx].append(hit)
+            while used_bytes + size_bytes > capacity:
+                _neg, pos, victim = heapq.heappop(heap)
+                resident = cache.get(victim)
+                if resident is not None and resident[0] == pos:
+                    used_bytes -= cache.pop(victim)[1]
+            cache[kid] = i, size_bytes
+            used_bytes += size_bytes
+            heapq.heappush(heap, (-next_use[i], i, kid))
 
         def _mean(xs: list[int], default: float) -> float:
             return sum(xs) / len(xs) if xs else default
@@ -378,13 +378,13 @@ class BidawEvictionPolicy(EvictionPolicy):
     # ------------------------------------------------------------------
     def _bucket_of(self, wrd: float) -> tuple[int, int]:
         """(kind, index): 0=small, 1=promising, 2=extreme."""
-        if wrd < self._capacity_keys:
+        if wrd < self._capacity_bytes:
             return 0, 0
         if wrd < self._extreme_threshold:
-            span = self._extreme_threshold - self._capacity_keys
+            span = self._extreme_threshold - self._capacity_bytes
             idx = min(
                 int(
-                    (wrd - self._capacity_keys)
+                    (wrd - self._capacity_bytes)
                     / max(span, 1.0)
                     * self._promising_buckets
                 ),
@@ -412,39 +412,15 @@ class BidawEvictionPolicy(EvictionPolicy):
             return 0.5  # no evidence: neutral; recency breaks ties
 
         answer_len = self._salt_last_answer.get(salt)
-        lb = None
-        if respect_lb and answer_len is not None:
-            bin_id = min(answer_len // _LB_BIN_TOKENS, 63)
-            lb = self._lb_min.get(bin_id)
-
-        small = prom = extreme = 0
+        lb = self._lb_min.get(answer_len) if respect_lb and answer_len is not None else None
+        first_bucket = self._bucket_of(lb) if lb is not None else (0, 0)
         total = 0
-        prom_mass = [0.0] * self._promising_buckets
+        hits = 0.0
         for wrd in hist:
-            if lb is not None and wrd < lb:
-                continue  # pruned: next access cannot be this close
-            kind, idx = self._bucket_of(wrd)
-            if kind == 0:
-                small += 1
-            elif kind == 1:
-                prom += 1
-                prom_mass[idx] += 1.0
-            else:
-                extreme += 1
+            bucket = self._bucket_of(wrd)
+            if bucket < first_bucket:
+                continue
+            hits += self._bucket_hit(*bucket)
             total += 1
 
-        if total == 0:
-            if lb is None:
-                return 0.5
-            kind, idx = self._bucket_of(max(lb, 0.0))
-            return self._bucket_hit(kind, idx)
-
-        ghost_prom = (
-            self._ghost[1]
-            if self._ghost is not None
-            else [0.5] * self._promising_buckets
-        )
-        potential = small / total * 1.0 + extreme / total * 0.0
-        for i in range(self._promising_buckets):
-            potential += prom_mass[i] / total * ghost_prom[i]
-        return potential
+        return hits / total if total else self._bucket_hit(*first_bucket)

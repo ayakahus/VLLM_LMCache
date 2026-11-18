@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from bidaw import policy_registry
+from bidaw import l2_event_probe, policy_registry
 from bidaw.reuse_distance import ReuseDistance
 from bidaw import trace_replay as replay
 
@@ -78,11 +78,11 @@ class DistanceTests(unittest.TestCase):
     def test_matches_slow_distinct_reference_through_compaction(self):
         rng, trace, tracker = random.Random(12), [], ReuseDistance()
         for _ in range(12_000):
-            k = rng.randrange(80)
-            prev = next((i for i in range(len(trace)-1, -1, -1) if trace[i] == k), None)
-            expected = None if prev is None else len(set(trace[prev+1:]))
-            self.assertEqual(tracker.access(k), expected)
-            trace.append(k)
+            k, weight = rng.randrange(80), rng.randrange(256)
+            prev = next((i for i in range(len(trace)-1, -1, -1) if trace[i][0] == k), None)
+            expected = None if prev is None else sum(dict(trace[prev+1:]).values())
+            self.assertEqual(tracker.access(k, weight), expected)
+            trace.append((k, weight))
 
     def test_bounded_history_censors_forgotten_identity(self):
         tracker = ReuseDistance(max_keys=2)
@@ -109,18 +109,26 @@ class PolicyTests(unittest.TestCase):
         self.assertIn(a, self.p._tracked)
 
     def test_eviction_preserves_history(self):
-        a, b = key('A'), key('B')
-        self.p.on_keys_created([a])
-        self.p.on_request_access([a]); self.p.on_keys_removed([a])
-        self.p.on_request_access([b]); self.p.on_keys_created([a])
-        self.p.on_request_access([a])
-        self.assertEqual(list(self.p._salt_hist['u']), [1])
-
-    def test_request_dedup_and_zero_distance(self):
         a = key('A')
-        self.p.on_request_access([a, a]); self.p.on_request_access([a])
-        self.assertEqual(self.p._seq, 2)
-        self.assertEqual(list(self.p._salt_hist['u']), [0])
+        self.p.on_keys_created([a])
+        self.p.on_conversation_access('u', 20); self.p.on_keys_removed([a])
+        self.p.on_conversation_access('v', 30); self.p.on_keys_created([a])
+        self.p.on_conversation_access('u', 40)
+        self.assertEqual(list(self.p._salt_hist['u']), [30])
+
+    def test_one_sample_per_round_with_distinct_other_users(self):
+        for salt, size in [('u', 0), ('v', 30), ('v', 45), ('w', 12), ('u', 20), ('u', 34)]:
+            self.p.on_conversation_access(salt, size)
+        self.assertEqual(self.p._seq, 6)
+        self.assertEqual(list(self.p._salt_hist['u']), [57, 0])
+
+    def test_lookup_retry_does_not_train_as_an_extra_round(self):
+        self.p.on_conversation_access('u', 0, 'first')
+        self.p.on_conversation_access('v', 50, 'other')
+        self.p.on_conversation_access('u', 0, 'first')
+        self.p.on_conversation_access('u', 32, 'second')
+        self.assertEqual(self.p._logical_requests, 3)
+        self.assertEqual(list(self.p._salt_hist['u']), [50])
 
     def test_identity_preserves_tenant_and_rank(self):
         self.assertNotEqual(self.p._key_id(key('A', 'u')), self.p._key_id(key('A', 'v')))
@@ -128,36 +136,37 @@ class PolicyTests(unittest.TestCase):
 
     def test_ghost_builds_and_records_snapshot_sequence(self):
         self.p._ghost_window = 256
-        for i in range(200):
-            self.p.on_request_access([key(i % 20)])
+        for i in range(80):
+            self.p.on_conversation_access(str(i % 20), 100)
         self.p._rebuild_ghost()
         self.assertIsNotNone(self.p._ghost)
-        self.assertEqual(self.p._ghost_built_seq, 200)
+        self.assertEqual(self.p._ghost_built_seq, 80)
         self.assertEqual(self.p._ghost[0], 1.0)
 
     def test_ghost_matches_slow_belady_bucket_reference(self):
         self.p._ghost_window = 256
-        self.p._capacity_keys = 3
-        self.p._extreme_threshold = 18
+        self.p._capacity_bytes = 40
+        self.p._extreme_threshold = 240
         rng = random.Random(5)
-        trace = [rng.randrange(10) for _ in range(180)]
-        for value in trace:
-            self.p.on_request_access([key(value)])
+        trace = [(str(rng.randrange(10)), rng.randrange(60)) for _ in range(180)]
+        for salt, size in trace:
+            self.p.on_conversation_access(salt, size)
         self.p._rebuild_ghost()
-        cache, buckets = set(), [[] for _ in range(self.p._promising_buckets)]
-        for i, value in enumerate(trace):
-            hit = value in cache
-            prev = next((j for j in range(i-1,-1,-1) if trace[j] == value),None)
-            if prev is not None:
-                distance = len(set(trace[prev+1:i]))
+        cache, buckets = {}, [[] for _ in range(self.p._promising_buckets)]
+        for i, (salt, size) in enumerate(trace):
+            hit = cache.pop(salt, None) is not None and size <= 40
+            prev = next((j for j in range(i-1,-1,-1) if trace[j][0] == salt),None)
+            if prev is not None and size:
+                distance = sum(dict(trace[prev+1:i]).values())
                 kind, idx = self.p._bucket_of(distance)
                 if kind == 1: buckets[idx].append(int(hit))
-            if not hit:
-                if len(cache) >= 3:
-                    def next_use(k):
-                        return next((j for j in range(i+1,len(trace)) if trace[j] == k),float('inf'))
-                    cache.remove(max(cache,key=next_use))
-                cache.add(value)
+            if 0 < size <= 40:
+                def next_use(k):
+                    return next((j for j in range(i+1,len(trace)) if trace[j][0] == k),
+                                float('inf'))
+                while sum(cache.values()) + size > 40:
+                    del cache[max(cache, key=next_use)]
+                cache[salt] = size
         for i, bucket in enumerate(buckets):
             if bucket:
                 self.assertAlmostEqual(self.p._ghost[1][i],sum(bucket)/len(bucket))
@@ -190,10 +199,12 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual([k for action in actions for k in action.keys], salted)
 
     def test_unsalted_access_counts_in_global_reuse_distance(self):
-        salted, unsalted = key('A'), key('B', '')
-        for accessed in (salted, unsalted, unsalted, salted):
-            self.p.on_request_access([accessed])
-        self.assertEqual(list(self.p._salt_hist['u']), [1])
+        unsalted = key('B', '')
+        self.p.on_conversation_access('u', 100)
+        self.p.on_request_access({unsalted: 20})
+        self.p.on_request_access({unsalted: 20})
+        self.p.on_conversation_access('u', 110)
+        self.assertEqual(list(self.p._salt_hist['u']), [20])
         self.assertNotIn('', self.p._salt_hist)
         self.assertEqual(len(self.p._trace), 4)
 
@@ -202,23 +213,34 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.p._lb_min, {})
         self.p.on_answer('u', 64)
         for _ in range(12): self.p._record_wrd('u', 5)
-        self.assertEqual(self.p._lb_min[2], 5)
+        self.assertEqual(self.p._lb_min, {64: 5})
 
     def test_unknown_answer_is_not_scored_in_the_short_answer_bin(self):
         unknown = key('a', 'unknown')
         known = key('b', 'known')
         self.p.on_keys_created([unknown, known])
         for candidate in (unknown, known):
-            self.p.on_request_access([candidate])
-            self.p.on_request_access([candidate])
+            self.p.on_conversation_access(candidate.cache_salt, 1)
+            self.p.on_conversation_access(candidate.cache_salt, 1)
 
-        self.p.on_answer('training', 16)
+        self.p.on_answer('training', 0)
         for _ in range(8):
             self.p._record_wrd('training', self.p._extreme_threshold)
         self.p.on_answer('known', 0)
 
         actions = self.p.get_eviction_actions(.5)
         self.assertEqual([k for action in actions for k in action.keys], [known])
+
+    def test_lower_bound_preserves_all_observations_in_its_bucket(self):
+        self.p._capacity_bytes = 16
+        self.p._extreme_threshold = 96
+        self.p._salt_hist['u'].extend([15, 17, 24, 27])
+        self.p.on_answer('u', 64)
+        self.p._lb_min[64] = 24
+        self.p._ghost = (1.0, [0.5, 0.2] + [0] * 6, 0)
+        self.assertAlmostEqual(self.p._potential('u', respect_lb=True), 0.4)
+        self.p.on_answer('u', 65)
+        self.assertAlmostEqual(self.p._potential('u', respect_lb=True), 0.55)
 
 
 class Tokenizer:
@@ -257,7 +279,7 @@ class ReplayTests(unittest.TestCase):
     def run_schedule(self, schedules, parallel=1, warmup=0, fail=False, sender=None):
         args = dict(parallel=parallel, warmup_seconds=warmup, salt_prefix='t',
                     no_cache=False, lmc='mock', vllm='mock', model='m')
-        def default_sender(*a):
+        def default_sender(*a, **kwargs):
             if fail: raise RuntimeError('test failure')
             time.sleep(.004)
             return dict(ttft_s=.001, total_s=.004, completion_tokens=a[3],
@@ -291,18 +313,18 @@ class ReplayTests(unittest.TestCase):
 
     def test_next_prompt_includes_exact_model_tokens_across_warmup_boundary(self):
         prompts = []
-        def sender(_base, prompt, _salt, max_tokens, _model):
-            prompts.append(prompt)
+        def sender(_base, prompt, _salt, max_tokens, _model, *, history_tokens):
+            prompts.append((prompt, history_tokens))
             return dict(ttft_s=.001, total_s=.001, completion_tokens=max_tokens,
                         completion_token_ids=[90 + len(prompts)])
         rows = {'u': [self.row(0, 0), self.row(1, .1), self.row(2, .1)]}
         records, *_ = self.run_schedule(rows, warmup=.05, sender=sender)
-        self.assertEqual(prompts, [[1], [1, 91, 2], [1, 91, 2, 92, 3]])
+        self.assertEqual(prompts, [([1], 0), ([1, 91, 2], 2), ([1, 91, 2, 92, 3], 4)])
         self.assertTrue(all('prompt_sha256' in record for record in records))
 
     def test_skipped_warmup_round_drops_dependent_rounds(self):
         prompts = []
-        def sender(_base, prompt, _salt, max_tokens, _model):
+        def sender(_base, prompt, _salt, max_tokens, _model, **kwargs):
             prompts.append(prompt)
             time.sleep(.15)
             return dict(ttft_s=.001, total_s=.15, completion_tokens=max_tokens,
@@ -339,7 +361,8 @@ class StreamTests(unittest.TestCase):
         with patch.dict(sys.modules, requests=requests), patch.object(
             replay.time, 'perf_counter', side_effect=[10, 11, 13]
         ):
-            result = replay.stream_ttft('url',[10,11],'salt',3,'model')
+            result = replay.stream_ttft('url',[10,11],'salt',3,'model',
+                                        history_tokens=0, round_id='round')
         self.assertEqual(result['completion_tokens'],3)
         self.assertEqual(result['completion_token_ids'], [41, 42, 43])
         self.assertEqual(result['ttft_s'], 1)
@@ -349,6 +372,9 @@ class StreamTests(unittest.TestCase):
         self.assertTrue(payload['return_token_ids'])
         self.assertFalse(payload['add_special_tokens'])
         self.assertTrue(payload['stream_options']['include_usage'])
+        self.assertEqual(payload['kv_transfer_params'], {
+            'lmcache.bidaw_history_tokens': 0, 'lmcache.bidaw_round_id': 'round',
+        })
 
     def test_rejects_trace_actual_length_mismatch(self):
         requests = module('requests', post=lambda *a,**k:self.response(2))
@@ -408,29 +434,49 @@ class SchedulerTests(unittest.TestCase):
         class Controller:
             def __init__(self):
                 self._submission_lock = threading.Lock()
+                self._stop_flag = threading.Event()
                 self._next_request_id = 1
                 self._submission_queue = []
                 self._pending_queue = deque()
                 self._in_flight_requests = {}
                 self._l2_adapters = [1]
-                self.released = 0
+                self.released = []
                 self.started = []
+                self.loaded = []
+                self.finished = []
                 def notify():
                     assert all(rid in self._bidaw_enqueue_monotonic for rid,_ in self._submission_queue)
                 self._submission_efd = types.SimpleNamespace(notify=notify)
             def submit_prefetch_request(self,spec): return 999
             def _start_pending_requests(self): pass
             def _lock_l1_keys(self,request): pass
-            def _release_all_locks(self,request): self.released += 1
+            def _release_all_locks(self,request): self.released.append(request.request_id)
             def _plan_load(self,*a): pass
-            def _finish_request(self,request): pass
+            def _finish_request(self,request): self.finished.append(request.request_id)
             def _can_admit_new_prefetch(self,spec): return True
-            def _start_lookup_phase(self,rid,spec): self.started.append(rid)
+            def _start_lookup_phase(self,rid,spec):
+                self.started.append(rid)
+                self._in_flight_requests[rid] = build(rid, spec)
+            def _advance_request(self,request,adapters): pass
+            def _poll_lookup_results(self,request,adapters): pass
+            def _transition_to_load_phase(self,request):
+                reserved = {0: types.SimpleNamespace(get_size=lambda: request.load_bytes)}
+                self._submit_load_tasks(request, reserved if request.load_bytes else {})
+            def _submit_load_tasks(self,request,reserved):
+                if reserved:
+                    self.loaded.append(request.request_id)
+                    request.all_loads_done = lambda: False
+            def _retire_request(self,request): self._in_flight_requests.pop(request.request_id)
+            def _cleanup_in_flight_requests(self): pass
         def build(rid,spec):
-            return types.SimpleNamespace(key_groups=spec.key_groups,
-                key_states=types.SimpleNamespace(l1_locked_keys={}), fetching_policy=spec.needs_l2)
+            return types.SimpleNamespace(request_id=rid, key_groups=spec.key_groups,
+                key_states=types.SimpleNamespace(l1_locked_keys={}), fetching_policy=spec.needs_l2,
+                phase='lookup', load_bytes=spec.load_bytes, all_lookups_done=lambda: True,
+                all_loads_done=lambda: True)
         pc = module('prefetch_controller', PrefetchController=Controller,
                     _build_request=build, _needs_l2_lookup=lambda a,b,c:c,
+                    PrefetchPhase=types.SimpleNamespace(LOOKUP='lookup'),
+                    get_size_bytes=lambda shapes, dtypes: shapes,
                     logger=logging.getLogger('test'))
         stubs = lmcache_stubs()
         stubs['lmcache.v1.distributed.storage_controllers'] = module('storage_controllers',prefetch_controller=pc)
@@ -438,9 +484,11 @@ class SchedulerTests(unittest.TestCase):
             apply_dual_queue_patch()
         return Controller
 
-    def spec(self, n=1, needs_l2=True):
-        return types.SimpleNamespace(key_groups=[types.SimpleNamespace(keys=[key(i) for i in range(n)])],
-                                     allowed_l2_memory_tags=None, needs_l2=needs_l2)
+    def spec(self, n=1, needs_l2=True, load_bytes=1, salt='u'):
+        layout = types.SimpleNamespace(shapes=4, dtypes=None)
+        group = types.SimpleNamespace(keys=[key(i, salt) for i in range(n)], layout_desc=layout)
+        return types.SimpleNamespace(key_groups=[group], allowed_l2_memory_tags=None,
+                                     needs_l2=needs_l2, load_bytes=load_bytes)
 
     def test_fast_lane_has_no_timestamp_leak(self):
         C = self.make_controller(True); c = C()
@@ -450,22 +498,92 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(c._bidaw_enqueue_monotonic, {})
         self.assertEqual(c._submission_queue, [])
 
-    def test_atomic_timestamp_is_instance_local_and_hrrn_works(self):
+    def test_disk_hrrn_ranks_reserved_bytes_and_keeps_abcu_dispatch_event(self):
         C = self.make_controller(True); c, other = C(), C()
-        c.submit_prefetch_request(self.spec(500)); c.submit_prefetch_request(self.spec(5))
+        c.submit_prefetch_request(self.spec(5, load_bytes=500))
+        c.submit_prefetch_request(self.spec(500, load_bytes=5))
+        c.submit_prefetch_request(self.spec(5, load_bytes=0))
         self.assertEqual(other._bidaw_enqueue_monotonic, {})
         c._pending_queue.extend(c._submission_queue)
         c._submission_queue.clear()
-        c._bidaw_enqueue_monotonic.update({1:time.monotonic()-.01,2:time.monotonic()-.008})
+        self.assertEqual(c.released, [])
         c._start_pending_requests()
-        self.assertEqual(c.started, [2,1])
+        self.assertEqual(c.started, [1, 2, 3])
+        self.assertEqual(c.released, [1, 2, 3])
+        c._bidaw_enqueue_monotonic.update({1:time.monotonic()-.01,2:time.monotonic()-.008})
+        for request in list(c._in_flight_requests.values()):
+            c._advance_request(request, {'lookup': {1}})
+        self.assertEqual(c.loaded, [])
+        self.assertEqual(c.finished, [3])
+        with patch.object(l2_event_probe, '_log') as log:
+            c._start_pending_requests()
+        self.assertEqual(c.loaded, [2, 1])
+        self.assertEqual(log.call_args_list[0].args, ('preparing', [{'request': f'{id(c)}:2'}]))
+        self.assertEqual(log.call_count, 2)
+        self.assertEqual(c._bidaw_disk_ready, {})
+        for request in list(c._in_flight_requests.values()):
+            c._retire_request(request)
         self.assertEqual(c._bidaw_enqueue_monotonic, {})
+
+    def test_metadata_admission_skips_head_and_cleanup_releases_waiting_pins(self):
+        C = self.make_controller(True); c = C()
+        c.submit_prefetch_request(self.spec(20))
+        c.submit_prefetch_request(self.spec(2))
+        c._pending_queue.extend(c._submission_queue)
+        c._can_admit_new_prefetch = lambda spec: len(spec.key_groups[0].keys) <= 10
+        c._start_pending_requests()
+        self.assertEqual(c.started, [2])
+        self.assertEqual(c.released, [2])
+        c._cleanup_in_flight_requests()
+        self.assertEqual(c.released, [2, 1])
+        self.assertEqual(c._bidaw_waiting_locks, {})
+
+    def test_enqueue_error_releases_waiting_pins(self):
+        C = self.make_controller(True); c = C()
+        with patch.object(c._submission_efd, 'notify', side_effect=OSError('closed')):
+            with self.assertRaises(OSError):
+                c.submit_prefetch_request(self.spec())
+        self.assertEqual(c.released, [1])
+        self.assertEqual(c._bidaw_enqueue_monotonic, {})
+        self.assertEqual(c._bidaw_waiting_locks, {})
+        self.assertEqual(c._submission_queue, [])
 
     def test_observation_stays_on_with_dq_disabled(self):
         C = self.make_controller(False); c = C()
         with patch('bidaw.policy_registry.feed_access') as observer:
-            self.assertEqual(c.submit_prefetch_request(self.spec()),999)
-        observer.assert_called_once()
+            self.assertEqual(c.submit_prefetch_request(self.spec(salt='')),999)
+        observer.assert_called_once_with({key(0, ''): 4})
+
+
+class LookupTests(unittest.TestCase):
+    def test_conversation_observed_before_native_empty_chunk_exit(self):
+        from bidaw.server_patch import _patch_conversation_lookup
+
+        class Lookup:
+            def lookup(self, key, tp_size):
+                return 'native result'
+
+        Lookup.lookup.handler_options = 'blocking'
+        layout = types.SimpleNamespace(shapes=256, dtypes=None)
+        registry = types.SimpleNamespace(find_group_layout_descs=lambda *args: {0: layout})
+        lookup = Lookup()
+        lookup.context = types.SimpleNamespace(chunk_size=256, layout_desc_registry=registry)
+        request = types.SimpleNamespace(cache_salt='user', model_name='model',
+            world_size=1, num_tokens=20, request_id='first',
+            request_configs={'lmcache.bidaw_history_tokens': 0})
+        stubs = {
+            'lmcache.utils': module('utils', get_size_bytes=lambda shapes, dtypes: shapes),
+            'lmcache.v1.multiprocess.modules.lookup': module('lookup', LookupModule=Lookup),
+        }
+        with patch.dict(sys.modules, stubs), patch.object(policy_registry, 'feed_conversation') as feed:
+            _patch_conversation_lookup()
+            self.assertEqual(Lookup.lookup.handler_options, 'blocking')
+            self.assertEqual(lookup.lookup(request, 1), 'native result')
+            feed.assert_called_once_with('user', 0, 'first')
+            request.request_configs['lmcache.bidaw_history_tokens'] = 14
+            request.request_id = 'second'
+            lookup.lookup(request, 1)
+            self.assertEqual(feed.call_args.args, ('user', 14, 'second'))
 
 
 if __name__ == '__main__':

@@ -52,10 +52,16 @@ def snapshot_status() -> dict[str, Any]:
     return {"policies": out}
 
 
-def feed_access(keys: list[Any]) -> int:
-    """Observe a logical lookup, including objects absent from L1/L2."""
+def feed_access(objects: dict[Any, int]) -> None:
+    """Account for the distinct objects in an unsalted lookup."""
     with _lock:
         targets = list(_policies)
     for policy in targets:
-        policy.on_request_access(keys)
-    return len(targets)
+        policy.on_request_access(objects)
+
+
+def feed_conversation(cache_salt: str, history_bytes: int, request_id: str) -> None:
+    with _lock:
+        targets = list(_policies)
+    for policy in targets:
+        policy.on_conversation_access(cache_salt, history_bytes, request_id)

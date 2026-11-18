@@ -1,5 +1,7 @@
 """CPU checks for padded-tail metadata, staging and transfer completion."""
 import importlib
+import io
+import json
 import struct
 import sys
 import unittest
@@ -109,6 +111,12 @@ class TailConnectorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         class Connector:
+            def __init__(self, config, role, kv_cache_config):
+                self._eager_prefetch = False
+                self.scheduler_adapter = NS(lmcache_tokens_per_chunk=256)
+                self._group_tokens_per_block = [16]
+                self.lazy_offload = False
+
             def request_finished(self, request, blocks):
                 return True, None
 
@@ -140,12 +148,23 @@ class TailConnectorTests(unittest.TestCase):
             "lmcache.v1.multiprocess.token_codec": module(
                 "codec", pack_token_ids=lambda tokens: struct.pack(f">{len(tokens)}I", *tokens)
             ),
-            "vllm.distributed.kv_transfer.kv_connector.v1.base": module("base", KVConnectorRole=NS()),
+            "vllm.distributed.kv_transfer.kv_connector.v1.base": module(
+                "base", KVConnectorRole=NS(SCHEDULER='scheduler')
+            ),
             "vllm.v1.request": module("request", RequestStatus=request_status),
         }
         with patch.dict(sys.modules, modules):
-            imported = importlib.import_module("bidaw.padded_tail_connector")
-            cls.connector_type = imported.BidawPaddedTailConnector
+            cls.mod = importlib.import_module("bidaw.padded_tail_connector")
+            cls.connector_type = cls.mod.BidawPaddedTailConnector
+
+    def test_eager_prefetch_follows_server_dual_queue_setting(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                status = {"padded_tail_store": True, "scheduler": {"enabled": enabled}}
+                with patch.object(self.mod, "version", side_effect=["0.33.0", "0.5.7.post1"]), \
+                     patch.object(self.mod, "urlopen", return_value=io.StringIO(json.dumps(status))):
+                    conn = self.connector_type(NS(speculative_config=None), 'scheduler')
+                self.assertIs(conn._eager_prefetch, enabled)
 
     def test_finish_queues_one_store_and_holds_pages_until_both_complete(self):
         for parent_first in (True, False):

@@ -96,15 +96,17 @@ def build_schedule(users, picked, tokenizer, args):
     return schedules, digest.hexdigest(), truncated
 
 
-def stream_ttft(base, prompt, salt, max_tokens, model, *, round_id=None):
+def stream_ttft(base, prompt, salt, max_tokens, model, *, round_id=None, history_tokens=None):
     import requests
     payload = dict(model=model, prompt=prompt, max_tokens=max_tokens,
                    temperature=0.0, ignore_eos=True, stream=True,
                    add_special_tokens=False, return_token_ids=True,
                    stream_options={'include_usage': True}, cache_salt=salt)
+    # LMCache forwards lmcache.* request metadata apart from cache identity.
+    if history_tokens is not None:
+        payload.setdefault('kv_transfer_params', {})['lmcache.bidaw_history_tokens'] = history_tokens
     if round_id is not None:
-        # LMCache forwards lmcache.* request metadata apart from cache identity.
-        payload['kv_transfer_params'] = {'lmcache.bidaw_round_id': round_id}
+        payload.setdefault('kv_transfer_params', {})['lmcache.bidaw_round_id'] = round_id
     started, first, usage = time.perf_counter(), None, None
     chunks = []
     completion_ids = []
@@ -244,6 +246,8 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                     continue
                 try:
                     sender_options = {}
+                    if not args.get('no_cache'):
+                        sender_options['history_tokens'] = len(history)
                     if track_fates:
                         round_id = uuid4().hex
                         sender_options['round_id'] = round_id
