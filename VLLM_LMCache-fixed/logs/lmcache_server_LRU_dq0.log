@@ -5779,3 +5779,7 @@ INFO:     127.0.0.1:39192 - "POST /bidaw/answer HTTP/1.1" 200 OK
 [32;20m[2026-11-19 14:12:13,787] LMCache INFO:[0m Stored 256 of 256 requested tokens in 0.007 seconds [3m(lmcache_driven_transfer.py:856:lmcache.v1.multiprocess.modules.lmcache_driven_transfer)[0m
 INFO:     127.0.0.1:39204 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34652 - "GET /bidaw/status HTTP/1.1" 200 OK
+[32;20m[2026-11-19 14:18:22,518] LMCache INFO:[0m PeriodicThread lmcache-usage-continuous entering main loop (interval=600.0s) [3m(periodic_thread.py:312:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:18:22,521] LMCache INFO:[0m PeriodicThread lmcache-usage-l2 entering main loop (interval=600.0s) [3m(periodic_thread.py:312:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:18:22,523] LMCache INFO:[0m PeriodicThread lmcache-usage-l1 entering main loop (interval=600.0s) [3m(periodic_thread.py:312:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:20:22,501] LMCache INFO:[0m Cleaned up 4 expired sessions [3m(session.py:353:lmcache.v1.multiprocess.session)[0m
