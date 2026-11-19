@@ -1,4 +1,4 @@
-Probe v4; report v6; run 248680a30fef4c45bda1ab71bbcf068a
+Probe v4; report v7; run 248680a30fef4c45bda1ab71bbcf068a
 Confirmed physical writes: 668
 Padded-tail writes (included above): 452
 Unique L2 locations written: 668
@@ -16,6 +16,6 @@ Writes without verified replay round: 0
 Delete events: 0
 
 A All observed later lookups hit DRAM: 34 writes (5.1%), 0.23 GiB
-B No later reuse request in a completed session: 273 writes (40.9%), 1.87 GiB
+B No later reuse request in the completed observation window: 273 writes (40.9%), 1.87 GiB
 C Bidaw eviction and preparing-queue readback: 114 writes (17.1%), 0.78 GiB
 U Unresolved: 247 writes (37.0%), 1.69 GiB

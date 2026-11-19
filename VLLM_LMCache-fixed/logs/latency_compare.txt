@@ -1,0 +1,22 @@
+两臂延迟对比 (paper trace frozen, u70, speed=20x, warmup=30s, L1=1GiB, L2 每臂冷启, 各重复 2 次)
+
+== LRU + FCFS (DQ off)  (schedule sha 一致: True)
+  [lat2] n=955 err=0 skip=0 TTFT mean=124.2/p50=112.2/p99=256.5  E2E mean=406.8/p50=381.0/p99=1084.2  L1=81.9% L2=10.9%
+  [lat2b] n=955 err=0 skip=0 TTFT mean=119.8/p50=109.8/p99=255.6  E2E mean=401.4/p50=368.6/p99=1099.0  L1=82.9% L2=9.5%
+
+== Bidaw + dual-queue  (schedule sha 一致: True)
+  [lat2] n=955 err=0 skip=0 TTFT mean=142.4/p50=125.8/p99=382.8  E2E mean=440.2/p50=405.8/p99=1132.0  L1=65.1% L2=23.1%
+  [lat2b] n=955 err=0 skip=0 TTFT mean=135.9/p50=121.1/p99=300.4  E2E mean=434.0/p50=403.8/p99=1150.1  L1=66.3% L2=20.8%
+
+metric (2次重复均值)                LRU + FCFS       Bidaw + DQ          Δ
+---------------------------------------------------------------------
+TTFT mean                         122.0ms          139.2ms     +17.2ms
+TTFT p50                          111.0ms          123.5ms     +12.5ms
+TTFT p90                          179.4ms          217.7ms     +38.3ms
+TTFT p99                          256.1ms          341.6ms     +85.5ms
+E2E total mean                    404.1ms          437.1ms     +33.0ms
+E2E total p50                     374.8ms          404.8ms     +30.0ms
+E2E total p90                     671.9ms          734.2ms     +62.3ms
+E2E total p99                    1091.6ms         1141.1ms     +49.4ms
+L1 hit                             82.4%           65.7%    -16.7%
+L2 hit                             10.2%           22.0%    +11.7%

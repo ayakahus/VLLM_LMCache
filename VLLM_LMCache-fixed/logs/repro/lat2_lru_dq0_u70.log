@@ -1,0 +1,6 @@
+[schedule] users=70 rounds=1361 measured_new_users=4 planned_arrival_rate=1.733/min sha256=af5aeafc01187965e969ae492a53a69ae9e5a087c478cd7c292d73b4d3a55cb7 truncated_sessions=1
+total_ms: mean=406.76 p99=1084.24
+ttft_ms: mean=124.23 p99=256.53
+offered_latency_ms: mean=413.38 p99=1144.21
+scheduling_lag_ms: mean=4.22 p99=68.01
+[summary] measured_ok=955 errors=0 skipped=0 wall=168.72s
