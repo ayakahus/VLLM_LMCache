@@ -6,8 +6,8 @@ from pathlib import Path
 
 LOGS = Path("/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/logs")
 ARMS = [
-    ("lat2_lru_dq0_u70", "lat2b_lru_dq0_u70", "LRU + FCFS (DQ off)"),
-    ("lat2_bidaw_dq1_u70", "lat2b_bidaw_dq1_u70", "Bidaw + dual-queue"),
+    ("lat3_lru_dq0_u70", "lat3b_lru_dq0_u70", "LRU + FCFS (DQ off)"),
+    ("lat3_bidaw_dq1_u70", "lat3b_bidaw_dq1_u70", "Bidaw + dual-queue"),
 ]
 FIELDS = ("total_ms", "ttft_ms", "offered_latency_ms", "scheduling_lag_ms")
 
@@ -26,7 +26,9 @@ def load(label):
     s = {"n": len(recs),
          "errors": sum("error" in r for r in d["records"]),
          "skipped": sum("skip_reason" in r for r in d["records"]),
-         "sha": d["schedule_sha256"]}
+         "sha": d["schedule_sha256"],
+         "exec": d.get("executed_prompt_sha256"),
+         "mode": d.get("content_mode")}
     for f in FIELDS:
         vals = [r[f] for r in recs if f in r]
         s[f] = dict(mean=st.mean(vals), p50=pct(vals, .5),
@@ -38,12 +40,15 @@ def load(label):
     return s
 
 
-lines = ["两臂延迟对比 (paper trace frozen, u70, speed=20x, warmup=30s, "
-         "L1=1GiB, L2 每臂冷启, 各重复 2 次)", ""]
+lines = ["两臂延迟对比 — 固定回答历史 (--answer-history fixed)",
+         "(paper trace frozen, u70, speed=20x, warmup=30s, L1=1GiB, L2 每臂冷启, 各 2 次)", ""]
 all_stats = {}
+all_loads = {}
 for rep_labels, name in [(a[:2], a[2]) for a in ARMS]:
     reps = [load(lb) for lb in rep_labels]
     all_stats[name] = reps
+    all_loads[name] = [json.loads((LOGS / f"trace_replay_{lb}.json").read_text())
+                       for lb in rep_labels]
     shas = {r["sha"][:12] for r in reps}
     lines.append(f"== {name}  (schedule sha 一致: {len(shas) == 1})")
     for lb, r in zip(rep_labels, reps):
@@ -54,6 +59,15 @@ for rep_labels, name in [(a[:2], a[2]) for a in ARMS]:
                      f"p99={r['total_ms']['p99']:.1f}  "
                      f"L1={r['l1']:.1%} L2={r['l2']:.1%}")
     lines.append("")
+
+execs = {d.get("executed_prompt_sha256")
+         for loads in all_loads.values() for d in loads}
+modes = {d.get("content_mode")
+         for loads in all_loads.values() for d in loads}
+lines.append(f"content_mode: {modes}")
+lines.append(f"executed_prompt_sha256 跨全部4轮一致: {len(execs) == 1} "
+             f"(共 {len(execs)} 个不同值)")
+lines.append("")
 
 
 def agg(name, field, agg_key):
