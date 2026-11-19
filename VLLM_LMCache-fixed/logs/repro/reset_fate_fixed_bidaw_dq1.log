@@ -1,0 +1,5 @@
+lmcache server: not running
+stopped: bidaw server entry
+stopped: vllm serve
+server[Bidaw] healthy
+VLLM_STARTED

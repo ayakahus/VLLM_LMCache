@@ -301,11 +301,20 @@ def classify(events):
 
 
 def main():
+    import argparse
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    marker, events = latest_run(LOG_DIR / "l2_events.jsonl")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log", type=Path, default=LOG_DIR / "l2_events.jsonl",
+                        help="Probe event log to classify (default: logs/l2_events.jsonl)")
+    parser.add_argument("--out", type=Path, default=LOG_DIR / "ssd_chunk_fate",
+                        help="Output prefix; writes <out>.txt, <out>.json, <out>_pie.png")
+    args = parser.parse_args()
+
+    marker, events = latest_run(args.log)
     report = {
         "report_version": 7,
         "probe_version": marker["version"],
@@ -342,7 +351,7 @@ def main():
         lines.append(f"{key} {label}: {classes[key]} writes ({percent:.1%}), "
                      f"{report['bytes'][key] / 2**30:.2f} GiB")
 
-    output = LOG_DIR / "ssd_chunk_fate"
+    output = args.out
     output.with_suffix(".txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
@@ -361,7 +370,7 @@ def main():
         ax.text(0.5, 0.5, "No confirmed writes in this run", ha="center", va="center")
         ax.axis("off")
     ax.set_title(f"Bidaw L2 write fates ({total} confirmed writes)")
-    fig.savefig(LOG_DIR / "ssd_chunk_fate_pie.png", dpi=150, bbox_inches="tight")
+    fig.savefig(args.out.parent / f"{args.out.name}_pie.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
