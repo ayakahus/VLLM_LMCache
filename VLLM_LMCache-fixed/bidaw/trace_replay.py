@@ -73,6 +73,9 @@ def build_schedule(users, picked, tokenizer, args):
     pool = tokenizer.encode(words, add_special_tokens=False)
     if not pool:
         raise ValueError('Empty token pool')
+    prefix_size = args.get('shared_prefix_tokens', 0)
+    prefix_rng = random.Random(args['seed'])
+    shared_prefix = [prefix_rng.choice(pool) for _ in range(prefix_size)]
     t0 = min(users[u][0]['ts'] for u in picked)
     schedules, digest = {}, hashlib.sha256()
     truncated = []
@@ -81,12 +84,13 @@ def build_schedule(users, picked, tokenizer, args):
         history_len = 0
         rows = []
         for r in users[uid]:
-            prompt_len = history_len + r['qlen']
+            prefix = shared_prefix if not rows else []
+            prompt_len = history_len + len(prefix) + r['qlen']
             if (not 1 <= prompt_len <= args['max_prompt_tokens']
                     or prompt_len + r['rlen'] > args['max_model_len']):
                 truncated.append(dict(user=uid, round=r['rnd'], reason='context_limit'))
                 break
-            query_ids = [rng.choice(pool) for _ in range(r['qlen'])]
+            query_ids = prefix + [rng.choice(pool) for _ in range(r['qlen'])]
             row = dict(r, query_token_ids=query_ids, prompt_tokens=prompt_len,
                        due=(r['ts'] - t0) / args['speed'])
             rows.append(row)
@@ -96,17 +100,22 @@ def build_schedule(users, picked, tokenizer, args):
     return schedules, digest.hexdigest(), truncated
 
 
-def stream_ttft(base, prompt, salt, max_tokens, model, *, round_id=None, history_tokens=None):
+def stream_ttft(base, prompt, salt, max_tokens, model, *, round_id=None, history_tokens=None,
+                session_id=None):
     import requests
     payload = dict(model=model, prompt=prompt, max_tokens=max_tokens,
                    temperature=0.0, ignore_eos=True, stream=True,
                    add_special_tokens=False, return_token_ids=True,
-                   stream_options={'include_usage': True}, cache_salt=salt)
+                   stream_options={'include_usage': True})
+    if salt:
+        payload['cache_salt'] = salt
     # LMCache forwards lmcache.* request metadata apart from cache identity.
     if history_tokens is not None:
         payload.setdefault('kv_transfer_params', {})['lmcache.bidaw_history_tokens'] = history_tokens
     if round_id is not None:
         payload.setdefault('kv_transfer_params', {})['lmcache.bidaw_round_id'] = round_id
+    if session_id is not None:
+        payload.setdefault('kv_transfer_params', {})['lmcache.bidaw_session_id'] = session_id
     started, first, usage = time.perf_counter(), None, None
     chunks = []
     completion_ids = []
@@ -163,12 +172,18 @@ def report_answer(lmc, salt, answer_tokens):
     return response.json().get('policies_updated', 0)
 
 
-def report_fate_round(lmc, salt, round_index, phase, round_id):
+def report_fate_round(lmc, session, round_index, phase, round_id, *, shared_cache=False):
     import requests
     response = requests.post(f'{lmc}/bidaw/fate/round',
-        json=dict(cache_salt=salt, round_index=round_index, phase=phase, round_id=round_id),
+        json=dict(cache_salt=session, round_index=round_index, phase=phase, round_id=round_id,
+                  shared_cache=shared_cache),
         timeout=10)
     response.raise_for_status()
+
+
+def report_shared_replay_end(lmc):
+    import requests
+    requests.post(f'{lmc}/bidaw/fate/shared-replay-end', timeout=10).raise_for_status()
 
 
 def metrics_snapshot(lmc):
@@ -214,7 +229,9 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
     boundary_task = asyncio.create_task(boundary())
 
     async def replay_user(uid, rows):
-        salt = f"{args['salt_prefix']}-{uid}"
+        session = f"{args['salt_prefix']}-{uid}"
+        shared_cache = args.get('shared_cache', False)
+        salt = '' if shared_cache else session
         history = []
         previous_failed = False
         warmup_skipped = False
@@ -222,7 +239,7 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
         complete = bool(rows) and uid not in args.get('truncated_fate_users', ())
         for row in rows:
             phase = 'warmup' if row['due'] < warmup else 'measure'
-            record = dict(user=salt, round=row['rnd'], ts=row['ts'],
+            record = dict(user=session, round=row['rnd'], ts=row['ts'],
                           qlen=row['qlen'], rlen=row['rlen'],
                           prompt_tokens=row['prompt_tokens'], phase=phase,
                           scheduled_s=row['due'])
@@ -248,11 +265,14 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                     sender_options = {}
                     if not args.get('no_cache'):
                         sender_options['history_tokens'] = len(history)
+                    if shared_cache:
+                        sender_options['session_id'] = session
                     if track_fates:
                         round_id = uuid4().hex
                         sender_options['round_id'] = round_id
-                        await asyncio.to_thread(report_fate_round, args['lmc'], salt,
-                                                row['rnd'], 'start', round_id)
+                        await asyncio.to_thread(report_fate_round, args['lmc'], session,
+                                                row['rnd'], 'start', round_id,
+                                                shared_cache=shared_cache)
                     prompt = history + row['query_token_ids']
                     record['sent_s'] = time.perf_counter() - epoch
                     record['scheduling_lag_ms'] = 1000 * (record['sent_s'] - row['due'])
@@ -266,17 +286,19 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                                   offered_latency_ms=1000 * (record['completed_s'] - row['due']),
                                   actual_response_tokens=result['completion_tokens'])
                     if not args.get('no_cache'):
-                        updated = await asyncio.to_thread(reporter, args['lmc'], salt,
+                        updated = await asyncio.to_thread(reporter, args['lmc'], session,
                                                          result['completion_tokens'])
                         record['answer_policies_updated'] = updated
                         if args.get('require_answer_policy') and updated < 1:
                             raise RuntimeError('No Bidaw policy received the answer signal')
                     if track_fates:
-                        await asyncio.to_thread(report_fate_round, args['lmc'], salt,
-                                                row['rnd'], 'finish', round_id)
+                        await asyncio.to_thread(report_fate_round, args['lmc'], session,
+                                                row['rnd'], 'finish', round_id,
+                                                shared_cache=shared_cache)
                         if complete and row is rows[-1]:
-                            await asyncio.to_thread(report_fate_round, args['lmc'], salt,
-                                                    row['rnd'], 'session_end', round_id)
+                            await asyncio.to_thread(report_fate_round, args['lmc'], session,
+                                                    row['rnd'], 'session_end', round_id,
+                                                    shared_cache=shared_cache)
                     record['prompt_sha256'] = hashlib.sha256(
                         json.dumps(prompt, separators=(',', ':')).encode()
                     ).hexdigest()
@@ -317,6 +339,10 @@ def main():
     ap.add_argument('--model', default=MODEL_NAME)
     ap.add_argument('--model-dir', default=str(DEMO_DIR / 'models/Qwen2.5-1.5B-Instruct'))
     ap.add_argument('--salt-prefix', default='trace')
+    ap.add_argument('--shared-cache', action='store_true',
+                    help='Allow identical token prefixes to reuse KV across replay sessions')
+    ap.add_argument('--shared-prefix-tokens', type=int,
+                    help='Common synthetic prefix length (default: 256 with --shared-cache)')
     ap.add_argument('--label', default='smoke')
     ap.add_argument('--out', default='')
     ap.add_argument('--no-cache', action='store_true')
@@ -325,6 +351,12 @@ def main():
     ap.add_argument('--track-chunk-fates', action='store_true',
                     help='Send round markers to an LMCache server with BIDAW_L2_EVENT_LOG enabled')
     args = vars(ap.parse_args())
+    if args['shared_prefix_tokens'] is None:
+        args['shared_prefix_tokens'] = 256 if args['shared_cache'] else 0
+    if args['shared_prefix_tokens'] < 0 or (args['shared_prefix_tokens'] and not args['shared_cache']):
+        ap.error('--shared-prefix-tokens requires --shared-cache and a nonnegative length')
+    if args['shared_cache'] and args['no_cache']:
+        ap.error('--shared-cache requires LMCache')
     if args['track_chunk_fates'] and args['no_cache']:
         ap.error('--track-chunk-fates requires LMCache')
     if args['warmup_pass']:
@@ -371,6 +403,8 @@ def main():
     measured = [r for r in records if r['phase'] == 'measure' and 'prompt_sha256' in r]
     errors = [r for r in records if 'error' in r]
     skipped = sum('skip_reason' in r for r in records)
+    if args['shared_cache'] and args['track_chunk_fates'] and not errors:
+        report_shared_replay_end(args['lmc'])
     summary = dict(label=args['label'], args=args, content_mode='generated_token_prefix',
                    schedule_sha256=digest, executed_prompt_sha256=executed_digest,
                    planned_arrival_rate=rate,

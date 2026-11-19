@@ -74,6 +74,33 @@ class ChunkFateTests(unittest.TestCase):
         self.event("round_session_end", round=1)
         self.assertEqual(self.counts()["B"], 1)
 
+    def test_shared_write_checks_other_sessions_and_waits_for_replay_end(self):
+        def event(kind, salt, **fields):
+            self.events.append({**self.key, "ev": kind, "salt": salt,
+                                "t_ns": len(self.events), **fields})
+
+        def marker(phase, session, number):
+            event(f"round_{phase}", session, round=number, round_id=session, shared_cache=True)
+
+        marker("start", "writer", 2)
+        event("write", "", adapter="ssd", bytes=7, round_id="writer")
+        marker("finish", "writer", 2)
+        marker("session_end", "writer", 2)
+        self.assertEqual(self.counts()["U"], 1)
+
+        event("shared_replay_end", "")
+        self.assertEqual(self.counts()["B"], 1)
+        self.events.pop()
+        marker("start", "reader", 0)
+        event("lookup", "", request="reuse", round_id="reader")
+        marker("finish", "reader", 0)
+        marker("session_end", "reader", 0)
+        event("shared_replay_end", "")
+        self.assertEqual(self.counts()["U"], 1)
+
+        event("l1_hit", "", request="reuse")
+        self.assertEqual(self.counts()["A"], 1)
+
     def test_lookup_or_read_after_copy_closes_rules_out_b(self):
         self.start(0)
         self.write()

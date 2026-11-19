@@ -13,10 +13,20 @@ from bidaw.padded_tail import TAIL_VALID_TOKENS
 _log = None
 
 
-def record_round(cache_salt, round_index, phase, round_id=None):
+def record_round(cache_salt, round_index, phase, round_id=None, *, shared_cache=False):
     if _log is None:
         return False
-    _log(f"round_{phase}", [{"salt": cache_salt, "round": round_index, "round_id": round_id}])
+    fields = {"salt": cache_salt, "round": round_index, "round_id": round_id}
+    if shared_cache:
+        fields["shared_cache"] = True
+    _log(f"round_{phase}", [fields])
+    return True
+
+
+def record_shared_replay_end():
+    if _log is None:
+        return False
+    _log("shared_replay_end", [{}])
     return True
 
 

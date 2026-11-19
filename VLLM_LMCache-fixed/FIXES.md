@@ -164,4 +164,22 @@ python3 bidaw/l2_fate_report.py
 探针仅在 FS 读取任务中记录成功读回。旧日志中同时缺少 I/O 任务 ID 和预取请求 ID 的
 `load` 记录来自淘汰顺序刷新，报告会单独计数，并从读回统计和 A/B 判定中排除。
 
-默认 FS L2 配置不提供基于容量的全局淘汰。实验若没有实际 SSD 淘汰事件，不能据此估计 B 类的真实占比。
+默认 FS L2 配置不提供基于容量的全局淘汰。B 类衡量观测窗口内未被请求复用的写入。
+
+### 跨对话共享回放
+
+启用 `--shared-cache` 后，各对话使用 LMCache 的无 salt 缓存空间，相同 token 前缀可以复用 KV。
+回放保留独立的对话 ID、轮次和回答历史。默认给每个会话首轮加入同一段 256-token 合成前缀，
+后续轮次通过会话历史保留前缀。用 `--shared-prefix-tokens 0` 可保留原始回放的 token 生成方式。
+前缀计入上下文限制。无 salt 的对象使用 Bidaw 现有的共享对象淘汰分支，按对象最近使用时间排序。
+做策略对比时，各组使用相同的共享模式和前缀长度。
+
+用启用了 `BIDAW_L2_EVENT_LOG` 的独立 LMCache 实例，每次启动只跑一次带标记的共享回放：
+
+```bash
+python3 bidaw/trace_replay.py --users 35 --shared-cache --track-chunk-fates --label shared
+python3 bidaw/l2_fate_report.py
+```
+
+共享模式下，B 类等到全局回放结束标记，再检查写入后是否有任何对话查询或读取同一对象。
+该标记表示本次回放的观察窗口结束。报告的 B 类仅覆盖这个窗口，回放跳过或截断的轮次没有产生查询证据。

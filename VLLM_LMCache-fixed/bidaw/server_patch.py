@@ -83,20 +83,22 @@ def _patch_conversation_lookup() -> None:
 
     @wraps(original)  # preserve the MP handler registration metadata
     def lookup(self, key, tp_size):
-        if key.cache_salt:
+        configs = key.request_configs or {}
+        session = key.cache_salt or configs.get("lmcache.bidaw_session_id")
+        if isinstance(session, str) and session:
             ctx = self.context
             layouts = ctx.layout_desc_registry.find_group_layout_descs(
                 key.model_name, key.world_size
             )
             if layouts:
-                history_tokens = (key.request_configs or {}).get("lmcache.bidaw_history_tokens")
+                history_tokens = configs.get("lmcache.bidaw_history_tokens")
                 if type(history_tokens) is not int or not 0 <= history_tokens <= key.num_tokens:
                     history_tokens = key.num_tokens
                 chunk_bytes = key.world_size * sum(
                     get_size_bytes(layout.shapes, layout.dtypes) for layout in layouts.values()
                 )
                 policy_registry.feed_conversation(
-                    key.cache_salt,
+                    session,
                     history_tokens * chunk_bytes // ctx.chunk_size,
                     key.request_id,
                 )

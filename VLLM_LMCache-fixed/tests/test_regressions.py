@@ -276,6 +276,40 @@ class ReplayTests(unittest.TestCase):
         return dict(ts=index, qlen=1, rlen=1, rnd=index, due=due,
                     query_token_ids=[index + 1], prompt_tokens=2 * index + 1)
 
+    def test_shared_replay_uses_one_prefix_and_distinct_logical_sessions(self):
+        users = {uid: [dict(ts=0, qlen=2, rlen=1, rnd=0),
+                       dict(ts=1, qlen=2, rlen=1, rnd=1)] for uid in ("a", "b")}
+        args = dict(seed=7, max_prompt_tokens=300, max_model_len=300, speed=1000,
+                    shared_cache=True, shared_prefix_tokens=256, parallel=2, warmup_seconds=0,
+                    salt_prefix="t", lmc="mock", vllm="mock", model="m",
+                    track_chunk_fates=True, require_answer_policy=True)
+        schedules, _, truncated = replay.build_schedule(users, list(users), Tokenizer(), args)
+        self.assertFalse(truncated)
+        requests = {}
+        answers = []
+
+        def sender(_, prompt, salt, length, model, *, session_id, round_id, history_tokens):
+            requests[session_id, history_tokens] = (list(prompt), salt, round_id)
+            return dict(ttft_s=.001, total_s=.002, completion_tokens=length,
+                        completion_token_ids=[42] * length)
+
+        def reporter(_, session, length):
+            answers.append((session, length))
+            return 1
+
+        with patch.object(replay, "report_fate_round") as fate:
+            records, *_ = asyncio.run(replay.execute_schedule(
+                schedules, args, sender, reporter, lambda _: {}))
+
+        self.assertTrue(all("error" not in record for record in records))
+        self.assertEqual(requests["t-a", 0][0][:256], requests["t-b", 0][0][:256])
+        self.assertTrue(all(not salt for _, salt, _ in requests.values()))
+        self.assertEqual(len(requests["t-a", 259][0]), 261)
+        self.assertCountEqual(answers, [("t-a", 1), ("t-b", 1)] * 2)
+        ends = [call for call in fate.call_args_list if call.args[3] == "session_end"]
+        self.assertCountEqual([call.args[1] for call in ends], ["t-a", "t-b"])
+        self.assertTrue(all(call.kwargs["shared_cache"] for call in ends))
+
     def run_schedule(self, schedules, parallel=1, warmup=0, fail=False, sender=None):
         args = dict(parallel=parallel, warmup_seconds=warmup, salt_prefix='t',
                     no_cache=False, lmc='mock', vllm='mock', model='m')

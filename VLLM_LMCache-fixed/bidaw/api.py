@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 # First Party
 from bidaw import padded_tail, policy_registry
-from bidaw.l2_event_probe import record_round
+from bidaw.l2_event_probe import record_round, record_shared_replay_end
 
 router = APIRouter(tags=["bidaw"])
 
@@ -40,11 +40,20 @@ class FateRound(BaseModel):
     round_index: int = Field(ge=0)
     phase: Literal["start", "finish", "session_end"]
     round_id: str | None = Field(default=None, min_length=1)
+    shared_cache: bool = False
 
 
 @router.post("/bidaw/fate/round")
 def report_fate_round(body: FateRound) -> dict[str, bool]:
-    if not record_round(body.cache_salt, body.round_index, body.phase, body.round_id):
+    if not record_round(body.cache_salt, body.round_index, body.phase, body.round_id,
+                        shared_cache=body.shared_cache):
+        raise HTTPException(status_code=409, detail="L2 event probe is disabled")
+    return {"recorded": True}
+
+
+@router.post("/bidaw/fate/shared-replay-end")
+def report_shared_replay_end() -> dict[str, bool]:
+    if not record_shared_replay_end():
         raise HTTPException(status_code=409, detail="L2 event probe is disabled")
     return {"recorded": True}
 

@@ -8,7 +8,7 @@ from pathlib import Path
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 LABELS = {
     "A": "All observed later lookups hit DRAM",
-    "B": "No later reuse request in a completed session",
+    "B": "No later reuse request in the completed observation window",
     "C": "Bidaw eviction and preparing-queue readback",
     "U": "Unresolved",
 }
@@ -17,11 +17,12 @@ LABELS = {
 @dataclass
 class Write:
     size: int
-    salt: str
+    session: str
     round_index: int | None
     padded: bool
     key: tuple
     written_at: int
+    shared_cache: bool = False
     evicted_at: int = -1
     eviction_policy: str | None = None
     read_attempt: bool = False
@@ -36,8 +37,9 @@ class Write:
 
 @dataclass(frozen=True)
 class ReplayRound:
-    salt: str
+    session: str
     number: int
+    shared_cache: bool
 
 
 def latest_run(path):
@@ -87,24 +89,28 @@ def replay_rounds(events):
             continue
         if kind == "round_start":
             number = event["round"]
+            shared_cache = event.get("shared_cache", False)
             existing = rounds.get(round_id)
             if existing is not None:
-                invalid.update((salt, existing.salt))
+                invalid.update((salt, existing.session))
             if salt in ended or salt in open_rounds or (
                 salt in last_round and number <= rounds[last_round[salt]].number
             ):
                 invalid.add(salt)
-            rounds[round_id] = ReplayRound(salt, number)
+            rounds[round_id] = ReplayRound(salt, number, shared_cache)
             last_round[salt] = open_rounds[salt] = round_id
             continue
 
         scope = rounds.get(round_id)
         if kind in {"write", "lookup"}:
-            if (scope is not None and scope.salt == salt
-                    and (kind == "write" or open_rounds.get(salt) == round_id)):
+            if scope is None:
+                continue
+            matching_key = not salt if scope.shared_cache else scope.session == salt
+            if matching_key and (kind == "write" or open_rounds.get(scope.session) == round_id):
                 round_at[index] = (round_id, scope)
             continue
-        if scope is None or scope.salt != salt or scope.number != event["round"]:
+        if (scope is None or scope.session != salt or scope.number != event["round"]
+                or scope.shared_cache != event.get("shared_cache", False)):
             invalid.add(salt)
             continue
         if kind == "round_finish":
@@ -127,10 +133,13 @@ def classify(events):
     l1_hits = set()
     l2_hits = {}
     preparing = {}
+    shared_ends = []
     for index, event in enumerate(events):
         kind = event["ev"]
         if kind == "preparing":
             preparing[event["request"]] = index
+        elif kind == "shared_replay_end":
+            shared_ends.append(index)
         elif kind == "l1_hit":
             l1_hits.add((object_key(event), event["request"]))
         elif kind == "l2_hit":
@@ -158,6 +167,8 @@ def classify(events):
         if kind == "lookup":
             request_key = (key, event["request"])
             context = round_at.get(index)
+            if context is not None and context[1].shared_cache and context[1].session in invalid:
+                context = None
             if context is None:
                 last_unscoped_lookup[key] = index
             else:
@@ -167,7 +178,7 @@ def classify(events):
             for write in copies.values():
                 if context is None or write.round_index is None:
                     write.unknown_lookup = True
-                elif context[1].number > write.round_index:
+                elif context[1].session != write.session or context[1].number > write.round_index:
                     write.lookups.add(request_key)
         elif kind == "l1_evict":
             for write in copies.values():
@@ -189,8 +200,10 @@ def classify(events):
                 previous.closed = True
                 previous.pending_reads.clear()
             context = round_at.get(index)
-            write = Write(event["bytes"], event["salt"], context[1].number if context else None,
-                          padded, key, index)
+            scope = context[1] if context else None
+            write = Write(event["bytes"], scope.session if scope else event["salt"],
+                          scope.number if scope else None, padded, key, index,
+                          shared_cache=scope.shared_cache if scope else False)
             copies[adapter] = write
             writes.append(write)
         elif kind in {"load_attempt", "load"}:
@@ -236,19 +249,24 @@ def classify(events):
 
     effective_pairs = 0
     for write in writes:
-        session_ended = write.salt in ended
-        if write.salt in invalid or write.round_index is None:
+        if write.shared_cache:
+            observation_ended = len(shared_ends) == 1 and write.written_at < shared_ends[0]
+        else:
+            observation_ended = write.session in ended
+        if write.session in invalid or write.round_index is None:
             category = "U"
         elif write.qualifying_requests:
             category = "C"
             effective_pairs += len(write.qualifying_requests)
         elif (not write.read_attempt and not write.unknown_lookup
               and write.lookups and write.lookups <= l1_hits
-              and (write.closed or session_ended)):
+              and (write.closed or observation_ended)):
             category = "A"
-        elif session_ended:
+        elif observation_ended:
             lookup_at, lookup_round = last_scoped_lookup.get(write.key, (-1, -1))
-            later_lookup = lookup_at > write.written_at and lookup_round > write.round_index
+            later_lookup = lookup_at > write.written_at and (
+                write.shared_cache or lookup_round > write.round_index
+            )
             if (later_lookup or last_unscoped_lookup.get(write.key, -1) > write.written_at
                     or last_read.get(write.key, -1) > write.written_at):
                 category = "U"
@@ -265,7 +283,7 @@ def classify(events):
         "physical_writes": len(writes),
         "padded_tail_writes": padded_tail_writes,
         "writes_without_round_evidence": sum(
-            write.round_index is None or write.salt in invalid for write in writes
+            write.round_index is None or write.session in invalid for write in writes
         ),
         "unique": len(seen),
         "rewrite_events": rewrites,
@@ -289,7 +307,7 @@ def main():
 
     marker, events = latest_run(LOG_DIR / "l2_events.jsonl")
     report = {
-        "report_version": 6,
+        "report_version": 7,
         "probe_version": marker["version"],
         "run_id": marker["run"],
         **classify(events),
