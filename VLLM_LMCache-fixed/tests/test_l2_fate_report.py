@@ -64,17 +64,56 @@ class ChunkFateTests(unittest.TestCase):
         self.finish(1, last=True)
         self.assertEqual(self.counts()["U"], 1)
 
-    def test_dead_write_requires_session_end_and_both_evictions(self):
+    def test_unused_write_requires_session_end_but_not_eviction_or_final_round(self):
         self.start(0)
         self.write()
-        self.event("l1_evict", policy="bidaw_eviction_policy")
         self.finish(0)
-        self.event("delete", adapter="ssd", eviction=True)
+        self.start(1)
+        self.finish(1)
         self.assertEqual(self.counts()["U"], 1)
-        self.event("round_session_end", round=0)
+        self.event("round_session_end", round=1)
         self.assertEqual(self.counts()["B"], 1)
-        self.events[-2]["eviction"] = False
-        self.assertEqual(self.counts()["U"], 1)
+
+    def test_lookup_or_read_after_copy_closes_rules_out_b(self):
+        self.start(0)
+        self.write()
+        self.finish(0)
+        self.event("delete", adapter="ssd", eviction=False)
+        self.start(1)
+        before_access = len(self.events)
+        for kind, fields in (
+            ("lookup", {"request": "later"}),
+            ("lookup", {"request": "unscoped", "round_id": "missing"}),
+            ("load_attempt", {"adapter": "ssd", "io_task": "later"}),
+        ):
+            with self.subTest(kind=kind, fields=fields):
+                del self.events[before_access:]
+                self.event(kind, **fields)
+                self.finish(1, last=True)
+                self.assertEqual(self.counts()["U"], 1)
+
+    def test_legacy_recency_notification_does_not_count_as_an_ssd_read(self):
+        self.start(0)
+        self.write()
+        self.finish(0)
+        self.start(1)
+        self.event("lookup", request="1")
+        self.event("l1_hit", request="1")
+        self.event("load", adapter="ssd")
+        self.finish(1, last=True)
+
+        report = classify(self.events)
+        self.assertEqual(report["classes"]["A"], 1)
+        self.assertEqual(report["load_events"], 0)
+        self.assertEqual(report["unattributed_load_events"], 0)
+        self.assertEqual(report["legacy_touch_events"], 1)
+
+        self.event("load_attempt", adapter="ssd", io_task="1")
+        self.event("load", adapter="ssd", io_task="1")
+        report = classify(self.events)
+        self.assertEqual(report["classes"]["U"], 1)
+        self.assertEqual(report["load_events"], 1)
+        self.assertEqual(report["attributed_load_events"], 1)
 
     def readback(self, *, lookup_round_id=None, removed_again=False, padded=False):
         self.start(0)

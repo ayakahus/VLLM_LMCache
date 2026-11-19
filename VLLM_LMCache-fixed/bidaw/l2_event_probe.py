@@ -113,7 +113,9 @@ def apply_l2_event_probe() -> bool:
         return fields
 
     def accessed(self, keys):
-        log_keys("load", keys, load_fields(self))
+        # submit_touch also sends this notification, without reading any bytes.
+        if load_task.get() is not None:
+            log_keys("load", keys, load_fields(self))
         return notify_accessed(self, keys)
 
     async def load(self, keys, objects, task_id):

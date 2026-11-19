@@ -8,7 +8,7 @@ from pathlib import Path
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 LABELS = {
     "A": "All observed later lookups hit DRAM",
-    "B": "Final-round write evicted unread",
+    "B": "No later reuse request in a completed session",
     "C": "Bidaw eviction and preparing-queue readback",
     "U": "Unresolved",
 }
@@ -20,6 +20,8 @@ class Write:
     salt: str
     round_index: int | None
     padded: bool
+    key: tuple
+    written_at: int
     evicted_at: int = -1
     eviction_policy: str | None = None
     read_attempt: bool = False
@@ -27,7 +29,6 @@ class Write:
     load_events: int = 0
     load_requests: set[str] = field(default_factory=set)
     qualifying_requests: set[str] = field(default_factory=set)
-    ssd_evicted: bool = False
     closed: bool = False
     lookups: set = field(default_factory=set)
     unknown_lookup: bool = False
@@ -142,7 +143,12 @@ def classify(events):
     writes = []
     seen = set()
     lookups = {}
+    # B considers subsequent requests for the exact key even after a copy closes.
+    last_scoped_lookup = {}
+    last_unscoped_lookup = {}
+    last_read = {}
     rewrites = loads = deletes = unattributed_loads = padded_tail_writes = 0
+    legacy_touch_events = 0
 
     for index, event in enumerate(events):
         kind = event["ev"]
@@ -153,6 +159,10 @@ def classify(events):
         if kind == "lookup":
             request_key = (key, event["request"])
             context = round_at.get(index)
+            if context is None:
+                last_unscoped_lookup[key] = index
+            else:
+                last_scoped_lookup[key] = (index, context[1].number)
             if context is not None and copies:
                 lookups.setdefault(request_key, (index, *context))
             for write in copies.values():
@@ -180,16 +190,22 @@ def classify(events):
                 previous.closed = True
                 previous.pending_reads.clear()
             context = round_at.get(index)
-            write = Write(event["bytes"], event["salt"], context[1].number if context else None, padded)
+            write = Write(event["bytes"], event["salt"], context[1].number if context else None,
+                          padded, key, index)
             copies[adapter] = write
             writes.append(write)
         elif kind in {"load_attempt", "load"}:
-            for write in copies.values():
-                write.read_attempt = True
-            write = copies.get(event["adapter"])
             request = event.get("request")
             # Early version 3 logs have only the prefetch request ID.
             task = event.get("io_task") or request
+            if kind == "load" and task is None:
+                # Older probes logged recency notifications as loads, with neither ID.
+                legacy_touch_events += 1
+                continue
+            last_read[key] = index
+            for write in copies.values():
+                write.read_attempt = True
+            write = copies.get(event["adapter"])
             if kind == "load_attempt":
                 if write is not None and task is not None:
                     write.pending_reads[task] = index
@@ -216,7 +232,6 @@ def classify(events):
             if write is not None:
                 write.closed = True
                 write.pending_reads.clear()
-                write.ssd_evicted = event["eviction"]
                 if not copies:
                     del active[key]
 
@@ -232,10 +247,14 @@ def classify(events):
               and write.lookups and write.lookups <= l1_hits
               and (write.closed or session_ended)):
             category = "A"
-        elif (not write.read_attempt and not write.unknown_lookup
-              and write.ssd_evicted and write.evicted_at >= 0
-              and session_ended and ended[write.salt] == write.round_index):
-            category = "B"
+        elif session_ended:
+            lookup_at, lookup_round = last_scoped_lookup.get(write.key, (-1, -1))
+            later_lookup = lookup_at > write.written_at and lookup_round > write.round_index
+            if (later_lookup or last_unscoped_lookup.get(write.key, -1) > write.written_at
+                    or last_read.get(write.key, -1) > write.written_at):
+                category = "U"
+            else:
+                category = "B"
         else:
             category = "U"
         classes[category] += 1
@@ -252,6 +271,7 @@ def classify(events):
         "unique": len(seen),
         "rewrite_events": rewrites,
         "load_events": loads,
+        "legacy_touch_events": legacy_touch_events,
         "unattributed_load_events": unattributed_loads,
         "attributed_load_events": loads - unattributed_loads,
         "attributed_loads_per_write": (loads - unattributed_loads) / len(writes) if writes else None,
@@ -270,7 +290,7 @@ def main():
 
     marker, events = latest_run(LOG_DIR / "l2_events.jsonl")
     report = {
-        "report_version": 3,
+        "report_version": 5,
         "probe_version": marker["version"],
         "run_id": marker["run"],
         **classify(events),
@@ -286,6 +306,7 @@ def main():
         f"Unique L2 locations written: {report['unique']}",
         f"Physical rewrites: {report['rewrite_events']}",
         f"Successful backend load events (all): {report['load_events']}",
+        f"Legacy recency notifications excluded from loads: {report['legacy_touch_events']}",
         f"Successful loads attributed to this run's writes: {report['attributed_load_events']}",
         f"Successful loads without a matched write lifecycle: {report['unattributed_load_events']}",
         f"Physical writes read back at least once: {report['writes_read_back']}",

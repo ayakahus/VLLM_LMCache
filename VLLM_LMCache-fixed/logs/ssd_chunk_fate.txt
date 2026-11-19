@@ -1,11 +1,12 @@
-Probe v4; report v3; run 248680a30fef4c45bda1ab71bbcf068a
+Probe v4; report v5; run 248680a30fef4c45bda1ab71bbcf068a
 Confirmed physical writes: 668
 Padded-tail writes (included above): 452
 Unique L2 locations written: 668
 Physical rewrites: 0
-Successful backend load events (all): 5875
+Successful backend load events (all): 184
+Legacy recency notifications excluded from loads: 5691
 Successful loads attributed to this run's writes: 184
-Successful loads without a matched write lifecycle: 5691
+Successful loads without a matched write lifecycle: 0
 Physical writes read back at least once: 114
 Attributed backend loads per physical write: 0.28
 Distinct prefetch/write pairs with a readback: 184
@@ -14,7 +15,7 @@ Completed replay sessions: 48
 Writes without verified replay round: 0
 Delete events: 0
 
-A All observed later lookups hit DRAM: 0 writes (0.0%), 0.00 GiB
-B Final-round write evicted unread: 0 writes (0.0%), 0.00 GiB
+A All observed later lookups hit DRAM: 34 writes (5.1%), 0.23 GiB
+B No later reuse request in a completed session: 273 writes (40.9%), 1.87 GiB
 C Bidaw eviction and preparing-queue readback: 84 writes (12.6%), 0.57 GiB
-U Unresolved: 584 writes (87.4%), 3.99 GiB
+U Unresolved: 277 writes (41.5%), 1.89 GiB
