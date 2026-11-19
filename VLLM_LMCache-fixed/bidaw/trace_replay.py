@@ -79,8 +79,10 @@ def build_schedule(users, picked, tokenizer, args):
     t0 = min(users[u][0]['ts'] for u in picked)
     schedules, digest = {}, hashlib.sha256()
     truncated = []
+    fixed_history = args.get('answer_history') == 'fixed'
     for uid in picked:
         rng = random.Random(stable_seed(args['seed'], uid))
+        answer_rng = random.Random(stable_seed(args['seed'], f'answer:{uid}')) if fixed_history else None
         history_len = 0
         rows = []
         for r in users[uid]:
@@ -93,6 +95,8 @@ def build_schedule(users, picked, tokenizer, args):
             query_ids = prefix + [rng.choice(pool) for _ in range(r['qlen'])]
             row = dict(r, query_token_ids=query_ids, prompt_tokens=prompt_len,
                        due=(r['ts'] - t0) / args['speed'])
+            if answer_rng is not None:
+                row['fixed_answer_token_ids'] = [answer_rng.choice(pool) for _ in range(r['rlen'])]
             rows.append(row)
             digest.update(json.dumps([uid, row], sort_keys=True, separators=(',', ':')).encode())
             history_len = prompt_len + r['rlen']
@@ -212,6 +216,7 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
     sem = asyncio.Semaphore(args['parallel'])
     epoch = time.perf_counter()
     warmup = args['warmup_seconds']
+    fixed_history = args.get('answer_history') == 'fixed'
     records = []
 
     async def boundary():
@@ -280,7 +285,9 @@ async def execute_schedule(schedules, args, sender=stream_ttft, reporter=report_
                         salt, row['rlen'], args['model'], **sender_options)
                     # Capture network completion before the reporting HTTP call.
                     record['completed_s'] = time.perf_counter() - epoch
-                    history = prompt + result['completion_token_ids']
+                    answer_ids = (row['fixed_answer_token_ids'] if fixed_history
+                                  else result['completion_token_ids'])
+                    history = prompt + answer_ids
                     record.update(ttft_ms=result['ttft_s'] * 1000,
                                   total_ms=result['total_s'] * 1000,
                                   offered_latency_ms=1000 * (record['completed_s'] - row['due']),
@@ -339,6 +346,8 @@ def main():
     ap.add_argument('--model', default=MODEL_NAME)
     ap.add_argument('--model-dir', default=str(DEMO_DIR / 'models/Qwen2.5-1.5B-Instruct'))
     ap.add_argument('--salt-prefix', default='trace')
+    ap.add_argument('--answer-history', choices=('generated', 'fixed'), default='generated',
+                    help='Use live model answers or seeded synthetic answers in subsequent prompts')
     ap.add_argument('--shared-cache', action='store_true',
                     help='Allow identical token prefixes to reuse KV across replay sessions')
     ap.add_argument('--shared-prefix-tokens', type=int,
@@ -380,7 +389,8 @@ def main():
     rate = arrivals * 60 / duration
     print(f'[schedule] users={len(picked)} rounds={len(due_times)} '
           f'measured_new_users={arrivals} planned_arrival_rate={rate:.3f}/min '
-          f'sha256={digest} truncated_sessions={len(truncated)}')
+          f'sha256={digest} truncated_sessions={len(truncated)} '
+          f"answer_history={args['answer_history']}")
     if args['dry_run']:
         return 0
     import requests
@@ -405,7 +415,9 @@ def main():
     skipped = sum('skip_reason' in r for r in records)
     if args['shared_cache'] and args['track_chunk_fates'] and not errors:
         report_shared_replay_end(args['lmc'])
-    summary = dict(label=args['label'], args=args, content_mode='generated_token_prefix',
+    content_mode = ('fixed_answer_token_prefix' if args['answer_history'] == 'fixed'
+                    else 'generated_token_prefix')
+    summary = dict(label=args['label'], args=args, content_mode=content_mode,
                    schedule_sha256=digest, executed_prompt_sha256=executed_digest,
                    planned_arrival_rate=rate,
                    measured_interval_s=duration, wall_s=wall,

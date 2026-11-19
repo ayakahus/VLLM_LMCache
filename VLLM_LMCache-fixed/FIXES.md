@@ -91,7 +91,24 @@ python3 bidaw/repro_report.py
 ```
 
 结果写入 `logs/trace_replay_repro_v2_*.json` 和 `logs/repro_v2_report.txt`。
-旧报告脚本 `compare_arms.py` 仅保留用于历史结果，不用于新版复现实验。
+固定历史的 sweep 使用 `ANSWER_HISTORY=fixed bash run_repro_sweep.sh`，其回放 JSON
+使用 `trace_replay_repro_v2fixed_*.json`。旧报告脚本 `compare_arms.py` 仅保留用于历史结果。
+
+### 选择回放的回答历史
+
+- `--answer-history generated`（默认）把模型本轮实际生成的 token 放入后续轮次的历史。
+- `--answer-history fixed` 在回放前用相同的 seed、会话 ID 和轨迹回答长度生成固定的合成
+  回答 token。每轮仍实际调用模型生成输出并测量延迟，后续 prompt 使用预先固定的 token。
+  两组使用相同 trace、seed、tokenizer 和回放参数，并核对实际执行的 prompt 指纹。
+
+例如：
+
+```bash
+python3 bidaw/trace_replay.py --users 70 --speed 20 --answer-history fixed --label lru_fixed
+```
+
+固定历史下，当模型实际生成的回答与合成历史不同时，下一轮无法直接复用不同 token 所对应的
+decode KV。比较命中率和 SSD 写入时，所有实验组应使用同一种回答历史模式。
 
 ## 验证范围与剩余限制
 
@@ -102,7 +119,7 @@ python3 bidaw/repro_report.py
   GPU 准入。异步 KV 加载完成或请求被跳过后再入队，仍按原时间参与排序。
   显存分配失败的请求留待下一轮，引擎在当前轮继续尝试后续请求。
   GPU 沿用 16-token 物理页。回放通过 HTTP 接口上报上一轮实际回答长度。
-- 负载的时间和长度来自轨迹，查询内容为合成 token，历史回答来自实际生成。
+- 负载的时间和长度来自轨迹，查询内容为合成 token，历史回答可选实际生成或固定合成。
   该设置可用于验证 decode KV 的跨轮复用。实际命中取决于连接器已保存的完整 KV 块。
 - 当前只适用于同模型、同大小 BF16 chunk 的实验。Qwen2.5-1.5B 的 256-token
   chunk 占 7,340,032 bytes，补齐的尾块占用相同容量。其他模型或并行度需要验证布局，

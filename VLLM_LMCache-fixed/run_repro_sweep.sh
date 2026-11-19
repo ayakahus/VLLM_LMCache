@@ -8,6 +8,12 @@ source env.sh
 mkdir -p logs/repro
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 REPLAY_PARALLEL="${REPLAY_PARALLEL:-64}"
+ANSWER_HISTORY="${ANSWER_HISTORY:-generated}"
+case "$ANSWER_HISTORY" in
+    generated) label_prefix=repro_v2 ;;
+    fixed) label_prefix=repro_v2fixed ;;
+    *) echo "ANSWER_HISTORY must be generated or fixed" >&2; exit 2 ;;
+esac
 MODE="${1:-all}"  # all | baseline | cache
 
 replay() {
@@ -15,7 +21,7 @@ replay() {
     shift 2
     python3 bidaw/trace_replay.py --trace-dir bidaw/trace_frozen \
         --users "$users" --speed 60 --parallel "$REPLAY_PARALLEL" \
-        --warmup-seconds "$WARMUP_SECONDS" --label "$label" "$@" \
+        --warmup-seconds "$WARMUP_SECONDS" --answer-history "$ANSWER_HISTORY" --label "$label" "$@" \
         2>&1 | tee "logs/repro/${label}.log"
 }
 
@@ -24,7 +30,7 @@ if [[ "$MODE" == all || "$MODE" == baseline ]]; then
         ./stop_all.sh
         # Restart independently at every point; fail if readiness fails.
         VLLM_WITHOUT_LMCACHE=1 ./restart_vllm.sh
-        replay "repro_v2_vllm_u${U}" "$U" --no-cache
+        replay "${label_prefix}_vllm_u${U}" "$U" --no-cache
     done
 fi
 
@@ -39,7 +45,7 @@ if [[ "$MODE" == all || "$MODE" == cache ]]; then
                     > "logs/repro/status_${POLICY}_dq${DQ}_u${U}.json"
                 EXTRA=()
                 if [[ "$POLICY" == Bidaw ]]; then EXTRA+=(--require-answer-policy); fi
-                replay "repro_v2_${POLICY}_dq${DQ}_u${U}" "$U" "${EXTRA[@]}"
+                replay "${label_prefix}_${POLICY}_dq${DQ}_u${U}" "$U" "${EXTRA[@]}"
             done
         done
     done
@@ -48,4 +54,4 @@ if [[ "$MODE" != all && "$MODE" != baseline && "$MODE" != cache ]]; then
     echo "Usage: $0 [all|baseline|cache]" >&2
     exit 2
 fi
-python3 bidaw/repro_report.py
+python3 bidaw/repro_report.py --pattern "trace_replay_${label_prefix}_*.json"

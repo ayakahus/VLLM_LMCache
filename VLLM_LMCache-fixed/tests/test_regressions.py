@@ -272,6 +272,40 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual([len(row['query_token_ids']) for row in schedule['u']], [10, 9])
         self.assertEqual(truncated, [])
 
+    def test_fixed_answer_history_keeps_prompts_stable_across_live_replies(self):
+        users = {'u': [dict(ts=0, qlen=4, rlen=3, rnd=0),
+                       dict(ts=1, qlen=4, rlen=2, rnd=1)]}
+        args = dict(seed=7, max_prompt_tokens=30, max_model_len=30, speed=1000,
+                    parallel=1, warmup_seconds=0, salt_prefix='t', no_cache=False,
+                    lmc='mock', vllm='mock', model='m')
+        generated, generated_digest, _ = replay.build_schedule(users, ['u'], Tokenizer(), args)
+        args['answer_history'] = 'fixed'
+        fixed, fixed_digest, _ = replay.build_schedule(users, ['u'], Tokenizer(), args)
+        self.assertEqual(replay.build_schedule(users, ['u'], Tokenizer(), args)[1], fixed_digest)
+        self.assertNotEqual(generated_digest, fixed_digest)
+        first, second = fixed['u']
+        self.assertEqual([row['query_token_ids'] for row in fixed['u']],
+                         [row['query_token_ids'] for row in generated['u']])
+
+        def run(reply_id):
+            prompts = []
+
+            def sender(_, prompt, salt, length, model, *, history_tokens):
+                prompts.append(prompt)
+                return dict(ttft_s=.001, total_s=.002, completion_tokens=length,
+                            completion_token_ids=[reply_id] * length)
+
+            records, *_ = asyncio.run(replay.execute_schedule(
+                fixed, args, sender, lambda *a: 1, lambda _: {}))
+            self.assertEqual(prompts, [
+                first['query_token_ids'],
+                first['query_token_ids'] + first['fixed_answer_token_ids'] + second['query_token_ids'],
+            ])
+            self.assertEqual([r['actual_response_tokens'] for r in records], [3, 2])
+            return [r['prompt_sha256'] for r in records]
+
+        self.assertEqual(run(100), run(200))
+
     def row(self, index, due):
         return dict(ts=index, qlen=1, rlen=1, rnd=index, due=due,
                     query_token_ids=[index + 1], prompt_tokens=2 * index + 1)
