@@ -5783,3 +5783,24 @@ INFO:     127.0.0.1:34652 - "GET /bidaw/status HTTP/1.1" 200 OK
 [32;20m[2026-11-19 14:18:22,521] LMCache INFO:[0m PeriodicThread lmcache-usage-l2 entering main loop (interval=600.0s) [3m(periodic_thread.py:312:lmcache.v1.periodic_thread)[0m
 [32;20m[2026-11-19 14:18:22,523] LMCache INFO:[0m PeriodicThread lmcache-usage-l1 entering main loop (interval=600.0s) [3m(periodic_thread.py:312:lmcache.v1.periodic_thread)[0m
 [32;20m[2026-11-19 14:20:22,501] LMCache INFO:[0m Cleaned up 4 expired sessions [3m(session.py:353:lmcache.v1.multiprocess.session)[0m
+[32;20m[2026-11-19 14:30:00,210] LMCache INFO:[0m Unregistered KV cache for GPU ID 1225217162089337748 [3m(lmcache_driven_transfer.py:572:lmcache.v1.multiprocess.modules.lmcache_driven_transfer)[0m
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+[32;20m[2026-11-19 14:30:00,354] LMCache INFO:[0m Shutting down LMCache HTTP server... [3m(http_server.py:176:lmcache.v1.multiprocess.http_server)[0m
+[32;20m[2026-11-19 14:30:00,355] LMCache INFO:[0m Stopping PeriodicThread: lmcache-usage-l1 [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:00,356] LMCache INFO:[0m PeriodicThread lmcache-usage-l1 loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:00,819] LMCache INFO:[0m Stopping PeriodicThread: lmcache-usage-l2 [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:00,820] LMCache INFO:[0m PeriodicThread lmcache-usage-l2 loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:01,049] LMCache INFO:[0m Stopping PeriodicThread: lmcache-usage-continuous [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:01,050] LMCache INFO:[0m PeriodicThread lmcache-usage-continuous loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:02,214] LMCache INFO:[0m Stopping PeriodicThread: lmcache-mp-worker-reaper [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:02,215] LMCache INFO:[0m PeriodicThread lmcache-mp-worker-reaper loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:02,215] LMCache INFO:[0m Stopping PeriodicThread: DeviceHostFuncDispatcher [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:02,217] LMCache INFO:[0m PeriodicThread DeviceHostFuncDispatcher loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:02,217] LMCache INFO:[0m Stopping PeriodicThread: SessionManager-cleanup-thread-c2a20d1d6d0 [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:02,218] LMCache INFO:[0m PeriodicThread SessionManager-cleanup-thread-c2a20d1d6d0 loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-19 14:30:03,705] LMCache INFO:[0m FSL2Adapter closed [3m(fs_l2_adapter.py:511:lmcache.v1.distributed.l2_adapters.fs_l2_adapter)[0m
+[32;20m[2026-11-19 14:30:03,767] LMCache INFO:[0m MPCacheServer closed [3m(server.py:126:lmcache.v1.multiprocess.server)[0m
+[32;20m[2026-11-19 14:30:03,767] LMCache INFO:[0m LMCache HTTP server stopped [3m(http_server.py:194:lmcache.v1.multiprocess.http_server)[0m
+INFO:     Application shutdown complete.
+INFO:     Finished server process [2822601]
