@@ -151,6 +151,25 @@ class ChunkFateTests(unittest.TestCase):
         self.events[3]["policy"] = "LRU"
         self.assertEqual(self.counts()["U"], 2)
 
+    def test_c_requires_eviction_before_lookup_and_accepts_eviction_during_round(self):
+        self.start(0)
+        self.write()
+        self.finish(0)
+        self.start(1)
+        self.event("l1_evict", policy="bidaw_eviction_policy")
+        eviction = self.events[-1]
+        self.event("lookup", request="1")
+        lookup = self.events[-1]
+        self.event("preparing", request="1")
+        self.event("load_attempt", request="1", adapter="ssd")
+        self.event("load", request="1", adapter="ssd")
+        self.event("l2_hit", request="1")
+        self.finish(1)
+        self.assertEqual(self.counts()["C"], 1)
+
+        eviction["t_ns"], lookup["t_ns"] = lookup["t_ns"], eviction["t_ns"]
+        self.assertEqual(self.counts()["U"], 1)
+
     def test_same_salt_readback_without_matching_round_is_not_c(self):
         self.readback(lookup_round_id="another-request")
         self.event("l2_hit", request="1")

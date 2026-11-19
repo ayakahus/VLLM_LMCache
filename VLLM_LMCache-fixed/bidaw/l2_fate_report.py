@@ -38,7 +38,6 @@ class Write:
 class ReplayRound:
     salt: str
     number: int
-    started_at: int
 
 
 def latest_run(path):
@@ -95,7 +94,7 @@ def replay_rounds(events):
                 salt in last_round and number <= rounds[last_round[salt]].number
             ):
                 invalid.add(salt)
-            rounds[round_id] = ReplayRound(salt, number, index)
+            rounds[round_id] = ReplayRound(salt, number)
             last_round[salt] = open_rounds[salt] = round_id
             continue
 
@@ -164,7 +163,7 @@ def classify(events):
             else:
                 last_scoped_lookup[key] = (index, context[1].number)
             if context is not None and copies:
-                lookups.setdefault(request_key, (index, *context))
+                lookups.setdefault(request_key, (index, context[0]))
             for write in copies.values():
                 if context is None or write.round_index is None:
                     write.unknown_lookup = True
@@ -221,8 +220,8 @@ def classify(events):
             request_key = (key, request)
             if (not write.padded and request_key in write.lookups
                     and write.eviction_policy == "bidaw_eviction_policy"):
-                submitted, round_id, scope = lookups[request_key]
-                if (0 <= write.evicted_at < scope.started_at <= submitted
+                submitted, round_id = lookups[request_key]
+                if (0 <= write.evicted_at < submitted
                     < preparing.get(request, -1) < attempt < index
                     < l2_hits.get(request_key, -1) < finished_at.get(round_id, -1)):
                     write.qualifying_requests.add(request)
@@ -290,7 +289,7 @@ def main():
 
     marker, events = latest_run(LOG_DIR / "l2_events.jsonl")
     report = {
-        "report_version": 5,
+        "report_version": 6,
         "probe_version": marker["version"],
         "run_id": marker["run"],
         **classify(events),
