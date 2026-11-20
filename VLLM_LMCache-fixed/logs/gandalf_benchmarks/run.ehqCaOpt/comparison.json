@@ -1,0 +1,138 @@
+{
+  "repeat-1/lru": {
+    "requests": 1361,
+    "writes": 538,
+    "write_bytes": 3948937216,
+    "bytes_per_1000": 2901496852.3144746,
+    "prefix_l1": 0.8712078913083938,
+    "prefix_l2": 0.057882002605620694,
+    "cache_miss_tokens": 97536.0,
+    "gpu_prefill_tokens": 263090,
+    "ssd_evictions": 246,
+    "l1_drops": 0,
+    "migrations": 0,
+    "reused_ssd_copies": 0,
+    "blocked_migrations": 0,
+    "blocked_writes": 0,
+    "truncated_sessions": 1,
+    "latency_ms": {
+      "ttft_ms": {
+        "p50": 87.0855440152809,
+        "p95": 133.63243895582855,
+        "p99": 160.9603390097618
+      },
+      "total_ms": {
+        "p50": 310.2688890649006,
+        "p95": 690.611643018201,
+        "p99": 1017.0371170388535
+      },
+      "scheduling_lag_ms": {
+        "p50": 10.229241009795942,
+        "p95": 23.003452038395267,
+        "p99": 36.52301803231239
+      }
+    }
+  },
+  "repeat-1/lru_writeback": {
+    "requests": 1361,
+    "writes": 444,
+    "write_bytes": 3258974208,
+    "bytes_per_1000": 2394543870.683321,
+    "prefix_l1": 0.8786525218686023,
+    "prefix_l2": 0.05062348780941746,
+    "cache_miss_tokens": 97280.0,
+    "gpu_prefill_tokens": 262834,
+    "ssd_evictions": 152,
+    "l1_drops": 0,
+    "migrations": 444,
+    "reused_ssd_copies": 256,
+    "blocked_migrations": 0,
+    "blocked_writes": 0,
+    "truncated_sessions": 1,
+    "latency_ms": {
+      "ttft_ms": {
+        "p50": 87.07605407107621,
+        "p95": 125.72479993104935,
+        "p99": 153.19283003918827
+      },
+      "total_ms": {
+        "p50": 309.4577450538054,
+        "p95": 679.0852319682017,
+        "p99": 1026.1875089490786
+      },
+      "scheduling_lag_ms": {
+        "p50": 9.9703479558233,
+        "p95": 21.198221971282294,
+        "p99": 28.00599797628678
+      }
+    }
+  },
+  "repeat-1/bidaw": {
+    "requests": 1361,
+    "writes": 529,
+    "write_bytes": 3882876928,
+    "bytes_per_1000": 2852958800.881705,
+    "prefix_l1": 0.8101619207146845,
+    "prefix_l2": 0.11315838451516844,
+    "cache_miss_tokens": 105472.0,
+    "gpu_prefill_tokens": 271026,
+    "ssd_evictions": 237,
+    "l1_drops": 0,
+    "migrations": 0,
+    "reused_ssd_copies": 0,
+    "blocked_migrations": 0,
+    "blocked_writes": 0,
+    "truncated_sessions": 1,
+    "latency_ms": {
+      "ttft_ms": {
+        "p50": 79.9234010046348,
+        "p95": 125.4879729822278,
+        "p99": 152.4489229777828
+      },
+      "total_ms": {
+        "p50": 302.5070650037378,
+        "p95": 676.3162169372663,
+        "p99": 974.0870880195871
+      },
+      "scheduling_lag_ms": {
+        "p50": 10.577656980601091,
+        "p95": 24.771171947939763,
+        "p99": 35.91636200435744
+      }
+    }
+  },
+  "repeat-1/gandalf": {
+    "requests": 1361,
+    "writes": 530,
+    "write_bytes": 3890216960,
+    "bytes_per_1000": 2858351917.707568,
+    "prefix_l1": 0.8525963149078727,
+    "prefix_l2": 0.04541224641727154,
+    "cache_miss_tokens": 140288.0,
+    "gpu_prefill_tokens": 305842,
+    "ssd_evictions": 238,
+    "l1_drops": 1,
+    "migrations": 530,
+    "reused_ssd_copies": 98,
+    "blocked_migrations": 0,
+    "blocked_writes": 0,
+    "truncated_sessions": 1,
+    "latency_ms": {
+      "ttft_ms": {
+        "p50": 97.73768903687596,
+        "p95": 232.84571594558656,
+        "p99": 327.47839600779116
+      },
+      "total_ms": {
+        "p50": 333.52613099850714,
+        "p95": 782.5821780133992,
+        "p99": 1064.4217299995944
+      },
+      "scheduling_lag_ms": {
+        "p50": 12.320650042966008,
+        "p95": 48.839824041351676,
+        "p99": 79.62989702355117
+      }
+    }
+  }
+}

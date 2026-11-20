@@ -1,0 +1,191 @@
+{
+  "report_version": 1,
+  "definitions": {
+    "A": "All observed later lookups hit DRAM",
+    "B": "No later reuse request in the completed observation window",
+    "C": "Confirmed SSD readback followed by a matching L2 hit",
+    "U": "Unresolved"
+  },
+  "runs": {
+    "repeat-1/lru": {
+      "log": "logs/gandalf_benchmarks/run.ehqCaOpt/repeat-1/lru/l2_events.jsonl",
+      "run_id": "4976b350af5246488d3d0920b6aeaa74",
+      "probe_version": 4,
+      "classes": {
+        "A": 149,
+        "B": 198,
+        "C": 157,
+        "U": 34
+      },
+      "bytes": {
+        "A": 1093664768,
+        "B": 1453326336,
+        "C": 1152385024,
+        "U": 249561088
+      },
+      "physical_writes": 538,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 538,
+      "rewrite_events": 0,
+      "load_events": 311,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 311,
+      "attributed_loads_per_write": 0.5780669144981413,
+      "writes_read_back": 157,
+      "readback_prefetch_write_pairs": 311,
+      "qualifying_prefetch_write_pairs": 311,
+      "completed_replay_sessions": 69,
+      "delete_events": 0,
+      "physical_write_bytes": 3948937216,
+      "write_share": {
+        "A": 0.27695167286245354,
+        "B": 0.3680297397769517,
+        "C": 0.29182156133828996,
+        "U": 0.06319702602230483
+      },
+      "byte_share": {
+        "A": 0.27695167286245354,
+        "B": 0.3680297397769517,
+        "C": 0.29182156133828996,
+        "U": 0.06319702602230483
+      }
+    },
+    "repeat-1/lru_writeback": {
+      "log": "logs/gandalf_benchmarks/run.ehqCaOpt/repeat-1/lru_writeback/l2_events.jsonl",
+      "run_id": "8d181de0a08b40a78c82fbae5f57cb7b",
+      "probe_version": 4,
+      "classes": {
+        "A": 2,
+        "B": 287,
+        "C": 151,
+        "U": 4
+      },
+      "bytes": {
+        "A": 14680064,
+        "B": 2106589184,
+        "C": 1108344832,
+        "U": 29360128
+      },
+      "physical_writes": 444,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 444,
+      "rewrite_events": 0,
+      "load_events": 268,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 268,
+      "attributed_loads_per_write": 0.6036036036036037,
+      "writes_read_back": 151,
+      "readback_prefetch_write_pairs": 268,
+      "qualifying_prefetch_write_pairs": 268,
+      "completed_replay_sessions": 69,
+      "delete_events": 0,
+      "physical_write_bytes": 3258974208,
+      "write_share": {
+        "A": 0.0045045045045045045,
+        "B": 0.6463963963963963,
+        "C": 0.3400900900900901,
+        "U": 0.009009009009009009
+      },
+      "byte_share": {
+        "A": 0.0045045045045045045,
+        "B": 0.6463963963963963,
+        "C": 0.3400900900900901,
+        "U": 0.009009009009009009
+      }
+    },
+    "repeat-1/bidaw": {
+      "log": "logs/gandalf_benchmarks/run.ehqCaOpt/repeat-1/bidaw/l2_events.jsonl",
+      "run_id": "8518d2ee11bf42a3a3f497d961bd6bd9",
+      "probe_version": 4,
+      "classes": {
+        "A": 103,
+        "B": 191,
+        "C": 207,
+        "U": 28
+      },
+      "bytes": {
+        "A": 756023296,
+        "B": 1401946112,
+        "C": 1519386624,
+        "U": 205520896
+      },
+      "physical_writes": 529,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 529,
+      "rewrite_events": 0,
+      "load_events": 608,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 608,
+      "attributed_loads_per_write": 1.1493383742911154,
+      "writes_read_back": 207,
+      "readback_prefetch_write_pairs": 608,
+      "qualifying_prefetch_write_pairs": 608,
+      "completed_replay_sessions": 69,
+      "delete_events": 0,
+      "physical_write_bytes": 3882876928,
+      "write_share": {
+        "A": 0.1947069943289225,
+        "B": 0.3610586011342155,
+        "C": 0.391304347826087,
+        "U": 0.052930056710775046
+      },
+      "byte_share": {
+        "A": 0.1947069943289225,
+        "B": 0.3610586011342155,
+        "C": 0.391304347826087,
+        "U": 0.052930056710775046
+      }
+    },
+    "repeat-1/gandalf": {
+      "log": "logs/gandalf_benchmarks/run.ehqCaOpt/repeat-1/gandalf/l2_events.jsonl",
+      "run_id": "a5492b88f38d4c1986fd1f13e6e3cab4",
+      "probe_version": 4,
+      "classes": {
+        "A": 6,
+        "B": 280,
+        "C": 225,
+        "U": 19
+      },
+      "bytes": {
+        "A": 44040192,
+        "B": 2055208960,
+        "C": 1651507200,
+        "U": 139460608
+      },
+      "physical_writes": 530,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 428,
+      "rewrite_events": 102,
+      "load_events": 225,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 225,
+      "attributed_loads_per_write": 0.42452830188679247,
+      "writes_read_back": 225,
+      "readback_prefetch_write_pairs": 225,
+      "qualifying_prefetch_write_pairs": 225,
+      "completed_replay_sessions": 69,
+      "delete_events": 0,
+      "physical_write_bytes": 3890216960,
+      "write_share": {
+        "A": 0.011320754716981131,
+        "B": 0.5283018867924528,
+        "C": 0.42452830188679247,
+        "U": 0.035849056603773584
+      },
+      "byte_share": {
+        "A": 0.011320754716981131,
+        "B": 0.5283018867924528,
+        "C": 0.42452830188679247,
+        "U": 0.035849056603773584
+      }
+    }
+  }
+}

@@ -14,6 +14,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bidaw.trace_replay import percentile
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "logs/gandalf_benchmarks/run.ofRUSFwC"
+
+
+def default_root():
+    """Latest benchmark run under logs/gandalf_benchmarks, else the first run."""
+    parent = DEFAULT_ROOT.parent
+    runs = list(parent.glob("run.*")) if parent.is_dir() else []
+    return max(runs, key=lambda path: path.stat().st_mtime) if runs else DEFAULT_ROOT
+
 ARMS = [("lru", "LRU baseline"), ("lru_writeback", "LRU write-back"),
         ("bidaw", "Bidaw"), ("gandalf", "Gandalf")]
 COLORS = {"lru": "#6aa9e0", "lru_writeback": "#8fd18f",
@@ -108,13 +116,14 @@ def plot(rows, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_root", nargs="?", type=Path, default=DEFAULT_ROOT,
-                        help="Four-arm benchmark run directory")
+    parser.add_argument("run_root", nargs="?", type=Path, default=None,
+                        help="Four-arm benchmark run directory (default: the latest run)")
     parser.add_argument("--out", type=Path, default=None,
                         help="Output prefix; writes <out>.txt, <out>.json, <out>.png")
     args = parser.parse_args()
-    output = args.out or args.run_root / "latency_ttft_t2t"
-    rows = summarize(args.run_root)
+    run_root = args.run_root or default_root()
+    output = args.out or run_root / "latency_ttft_t2t"
+    rows = summarize(run_root)
     report = render(rows)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".txt").write_text(report, encoding="utf-8")
