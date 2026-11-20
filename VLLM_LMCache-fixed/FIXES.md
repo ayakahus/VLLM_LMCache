@@ -256,8 +256,10 @@ CUDA_VISIBLE_DEVICES=0 GANDALF_CACHE_ROOT=/mnt/nvme/gandalf \
 python3 -m bidaw.gandalf_fate_report logs/gandalf_benchmarks/run.XXXXXXXX
 ```
 
-在实验目录内生成 `ssd_write_fates.txt` 和 `ssd_write_fates.json`，逐组列出写入次数、
-字节数及各自占比。也可将单个 `l2_events.jsonl` 文件作为参数，独立分类。
+在实验目录内生成 `ssd_write_fates.txt`、`ssd_write_fates.json` 和一张
+`ssd_write_fates.png`。汇总图标出四组的淘汰策略、调度和写入方式，并以写入次数为分母，
+显示每组各类的占比。多次重复时，先按组累加写入次数，再计算占比。文本和 JSON 保留各次的
+写入次数、字节数及占比。也可将单个 `l2_events.jsonl` 文件作为参数，独立生成文本和 JSON。
 C 要求该次物理写入实际发生过 I/O 读取尝试和成功读回，随后同一请求对同一对象记录
 L2 命中。C 的判定独立于淘汰策略和调度路径。A、B 仍使用前文的回放证据，
 其余写入归 U。原有 `bidaw.l2_fate_report` 继续使用 Bidaw 专用判据。
