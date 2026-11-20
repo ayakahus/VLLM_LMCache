@@ -26,7 +26,7 @@ class Write:
     evicted_at: int = -1
     eviction_policy: str | None = None
     read_attempt: bool = False
-    pending_reads: dict[str, int] = field(default_factory=dict)
+    pending_reads: dict[str, tuple[int, str | None]] = field(default_factory=dict)
     load_events: int = 0
     load_requests: set[str] = field(default_factory=set)
     qualifying_requests: set[str] = field(default_factory=set)
@@ -126,7 +126,8 @@ def replay_rounds(events):
     return round_at, ended, invalid, finished_at
 
 
-def classify(events):
+def classify(events, *, confirmed_readback=False):
+    """Classify writes using the original Bidaw or policy-neutral C criterion."""
     # Submission events may be written after a fast-lane result.
     events = sorted(events, key=lambda event: event["t_ns"])
     round_at, ended, invalid, finished_at = replay_rounds(events)
@@ -151,6 +152,7 @@ def classify(events):
     writes = []
     seen = set()
     lookups = {}
+    confirmed_sources = {}
     # B considers subsequent requests for the exact key even after a copy closes.
     last_scoped_lookup = {}
     last_unscoped_lookup = {}
@@ -160,6 +162,12 @@ def classify(events):
 
     for index, event in enumerate(events):
         kind = event["ev"]
+        if confirmed_readback and kind == "l2_hit":
+            request = event["request"]
+            source = confirmed_sources.pop((object_key(event), request), None)
+            if source is not None:
+                source.qualifying_requests.add(request)
+            continue
         if kind not in {"write", "lookup", "l1_evict", "l1_remove", "load_attempt", "load", "delete"}:
             continue
         key = object_key(event)
@@ -220,18 +228,25 @@ def classify(events):
             write = copies.get(event["adapter"])
             if kind == "load_attempt":
                 if write is not None and task is not None:
-                    write.pending_reads[task] = index
+                    write.pending_reads[task] = (index, request)
                 continue
             loads += 1
-            attempt = write.pending_reads.pop(task, None) if write is not None else None
-            if attempt is None:
+            pending = write.pending_reads.pop(task, None) if write is not None else None
+            request_key = (key, request)
+            if confirmed_readback and request:
+                source = write if pending is not None and request == pending[1] else None
+                # A hit event identifies the request and object but not the
+                # adapter. Multiple different sources make attribution ambiguous.
+                if confirmed_sources.setdefault(request_key, source) is not source:
+                    confirmed_sources[request_key] = None
+            if pending is None:
                 unattributed_loads += 1
                 continue
+            attempt, _ = pending
             write.load_events += 1
             if request is not None:
                 write.load_requests.add(request)
-            request_key = (key, request)
-            if (not write.padded and request_key in write.lookups
+            if (not confirmed_readback and not write.padded and request_key in write.lookups
                     and write.eviction_policy == "bidaw_eviction_policy"):
                 submitted, round_id = lookups[request_key]
                 if (0 <= write.evicted_at < submitted
@@ -253,11 +268,12 @@ def classify(events):
             observation_ended = len(shared_ends) == 1 and write.written_at < shared_ends[0]
         else:
             observation_ended = write.session in ended
-        if write.session in invalid or write.round_index is None:
-            category = "U"
-        elif write.qualifying_requests:
+        valid_round = write.session not in invalid and write.round_index is not None
+        if write.qualifying_requests and (confirmed_readback or valid_round):
             category = "C"
             effective_pairs += len(write.qualifying_requests)
+        elif not valid_round:
+            category = "U"
         elif (not write.read_attempt and not write.unknown_lookup
               and write.lookups and write.lookups <= l1_hits
               and (write.closed or observation_ended)):

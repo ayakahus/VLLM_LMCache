@@ -247,3 +247,17 @@ CUDA_VISIBLE_DEVICES=0 GANDALF_CACHE_ROOT=/mnt/nvme/gandalf \
 指标快照和 L2 事件。比较报告包含 TTFT 和端到端 P50/P95/P99、FS 写入次数和字节、
 每千请求写入量、L1/L2 连续前缀命中、LMCache 未命中 token 和 vLLM 本地 prefill token。
 本地 prefill 包括新输入与历史重算；FS 写入统计反映主机侧 KV 写入量。
+
+### 四组 SSD 写入分类
+
+实验结束后，用四组的原始 L2 事件生成统一口径的 A/B/C/U 分布：
+
+```bash
+python3 -m bidaw.gandalf_fate_report logs/gandalf_benchmarks/run.XXXXXXXX
+```
+
+在实验目录内生成 `ssd_write_fates.txt` 和 `ssd_write_fates.json`，逐组列出写入次数、
+字节数及各自占比。也可将单个 `l2_events.jsonl` 文件作为参数，独立分类。
+C 要求该次物理写入实际发生过 I/O 读取尝试和成功读回，随后同一请求对同一对象记录
+L2 命中。C 的判定独立于淘汰策略和调度路径。A、B 仍使用前文的回放证据，
+其余写入归 U。原有 `bidaw.l2_fate_report` 继续使用 Bidaw 专用判据。

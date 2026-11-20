@@ -211,6 +211,31 @@ class ChunkFateTests(unittest.TestCase):
         self.finish(1)
         self.assertEqual(self.counts(), dict(A=0, B=0, C=0, U=1))
 
+    def test_confirmed_readback_c_matches_io_and_hit_without_policy_events(self):
+        self.write()
+        self.event("l2_hit", request="r")  # Too early to confirm this read.
+        self.event("load_attempt", request="r", adapter="ssd", io_task="read")
+        self.event("load", request="r", adapter="ssd", io_task="read")
+        self.event("l2_hit", request="other")
+        self.assertEqual(classify(self.events, confirmed_readback=True)["classes"]["U"], 1)
+
+        self.event("l2_hit", request="r")
+        result = classify(self.events, confirmed_readback=True)
+        self.assertEqual(result["classes"], dict(A=0, B=0, C=1, U=0))
+        self.assertEqual(result["bytes"]["C"], 7)
+        self.assertEqual(result["qualifying_prefetch_write_pairs"], 1)
+        self.assertEqual(self.counts()["U"], 1)
+
+    def test_confirmed_readback_does_not_assign_a_hit_to_ambiguous_copies(self):
+        for adapter in ("ssd-1", "ssd-2"):
+            self.event("write", adapter=adapter, bytes=7)
+            self.event("load_attempt", request="r", adapter=adapter, io_task=adapter)
+            self.event("load", request="r", adapter=adapter, io_task=adapter)
+        self.event("l2_hit", request="r")
+        result = classify(self.events, confirmed_readback=True)
+        self.assertEqual(result["writes_read_back"], 2)
+        self.assertEqual(result["classes"], dict(A=0, B=0, C=0, U=2))
+
     def test_padded_write_is_not_c_in_normal_replay(self):
         self.readback(padded=True)
         self.event("l2_hit", request="1")
@@ -260,3 +285,5 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(report["load_events"], 1)
         self.assertEqual(report["unattributed_load_events"], 1)
         self.assertEqual(report["writes_read_back"], 0)
+        self.event("l2_hit", request="r")
+        self.assertEqual(classify(self.events, confirmed_readback=True)["classes"]["C"], 0)
