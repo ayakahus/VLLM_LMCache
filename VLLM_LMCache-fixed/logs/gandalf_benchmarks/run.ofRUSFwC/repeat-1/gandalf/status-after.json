@@ -1,0 +1,30 @@
+{
+  "policies": [],
+  "padded_tail_store": false,
+  "scheduler": {
+    "enabled": false,
+    "fast_lane_hits": 0,
+    "fast_lane_fallbacks": 0,
+    "dispatches": 0,
+    "reordered_dispatches": 0,
+    "max_pending_wait_s": 0.0,
+    "last_dispatch_ratio": 0.0,
+    "last_dispatch_bytes": 0
+  },
+  "tier_policy": {
+    "active_evictions": 0,
+    "writes": 369,
+    "write_bytes": 2708471808,
+    "migrations": 369,
+    "reused_ssd_copies": 1820,
+    "ssd_evictions": 77,
+    "used_bytes": 2143289344,
+    "resident_objects": 292,
+    "mode": "gandalf",
+    "capacity_bytes": 2147483648,
+    "alpha": 1.0,
+    "l1_capacity_bytes": 1073741824,
+    "pending_keys": 0,
+    "in_flight_stores": 0
+  }
+}

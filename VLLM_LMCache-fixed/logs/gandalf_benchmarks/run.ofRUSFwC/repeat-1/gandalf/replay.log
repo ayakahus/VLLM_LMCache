@@ -1,0 +1,6 @@
+[schedule] users=70 rounds=1361 measured_new_users=70 planned_arrival_rate=24.926/min sha256=3ca9d40a4ccb3554920ab3caf44635caf9697bf0a0f373c2d81e138c834396de truncated_sessions=1 answer_history=fixed
+total_ms: mean=450.92 p99=1379.08
+ttft_ms: mean=139.38 p99=551.36
+offered_latency_ms: mean=469.55 p99=1412.24
+scheduling_lag_ms: mean=17.60 p99=99.07
+[summary] measured_ok=1361 errors=0 skipped=0 wall=168.79s
