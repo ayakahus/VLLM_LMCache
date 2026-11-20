@@ -34,7 +34,7 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual((drop.action, drop.key), ("drop", self.child))
         self.assertEqual(self.decision({self.child: 2}, {self.root: 2}).key, self.child)
 
-    def test_replacement_plan_adds_costs_and_preserves_required_ancestors(self):
+    def test_replacement_plan_prices_cheapest_victim_and_preserves_ancestors(self):
         victim, victim_child = Key("victim", "old"), Key("victim_child", "old")
         new, new_child, extra = Key("new", "incoming"), Key("new_child", "incoming"), Key("extra", "incoming")
         self.history.bind([victim, victim_child])
@@ -44,12 +44,62 @@ class PlacementTests(unittest.TestCase):
         decision = self.decision(dram, disk, eligible={new})
         self.assertEqual(decision.victims, (victim_child, victim))
         self.assertAlmostEqual(decision.replacement_cost, 1)
-        # Equal total costs reject a demotion at the strict threshold.
-        self.assertEqual(
-            self.decision(dram, disk, eligible={new}, fee=1 / 6),
-            None,
-        )
+        self.assertAlmostEqual(decision.move_score, .26)
         self.assertIsNone(self.decision(dram, disk, eligible={new}, pinned={victim_child}))
+
+    def test_move_gate_prefers_lower_cost_cold_root(self):
+        cold = Key("cold-root", "cold")
+        cold_child = Key("cold-child", "cold")
+        self.history.bind([cold, cold_child])
+        dram = dict.fromkeys((self.root, self.child, cold, cold_child), 1)
+        parents, _ = self.history.snapshot(dram)
+        with patch.object(self.history, "snapshot", return_value=(
+            parents, {"session": (1, .8), "cold": (20, .8)},
+        )):
+            decision = self.decision(dram, {}, fee=.2)
+        self.assertEqual((decision.action, decision.key), ("move", cold))
+        self.assertAlmostEqual(decision.move_score, .01)
+        self.assertAlmostEqual(decision.drop_score, .04)
+
+    def test_cross_object_gate_drops_cheaper_leaf_and_resolves_ties_to_drop(self):
+        cold = Key("cold-root", "cold")
+        cold_leaf = Key("cold-leaf", "cold")
+        self.history.bind([cold, cold_leaf])
+        dram = dict.fromkeys((self.root, self.child, cold, cold_leaf), 1)
+        parents, _ = self.history.snapshot(dram)
+        eligible = {self.root, cold_leaf}
+        with patch.object(self.history, "snapshot", return_value=(
+            parents, {"session": (1, .8), "cold": (20, .2)},
+        )):
+            for fee in (.2, .01):
+                with self.subTest(fee=fee):
+                    decision = self.decision(dram, {}, fee=fee, eligible=eligible)
+                    self.assertEqual((decision.action, decision.key), ("drop", cold_leaf))
+                    self.assertAlmostEqual(decision.drop_score, .01)
+                    self.assertAlmostEqual(decision.move_score, fee)
+
+    def test_hot_l1_duplicate_competes_with_the_cold_leaf(self):
+        duplicate = Key("duplicate", "hot")
+        self.history.bind([duplicate])
+        dram = dict.fromkeys((self.root, self.child, duplicate), 1)
+        parents, _ = self.history.snapshot(dram)
+        with patch.object(self.history, "snapshot", return_value=(
+            parents, {"session": (20, .2), "hot": (1, .8)},
+        )):
+            decision = self.decision(dram, {duplicate: 1}, fee=1)
+            retained_ssd = self.decision(dram, {duplicate: 1}, eligible={duplicate})
+        self.assertEqual((decision.action, decision.key), ("drop", self.child))
+        self.assertEqual((retained_ssd.action, retained_ssd.key), ("release_duplicate", duplicate))
+        self.assertEqual(retained_ssd.write_cost, 0)
+
+    def test_ssd_victim_plan_cannot_evict_internal_duplicate_around_pinned_leaf(self):
+        incoming = Key("incoming", "new")
+        incoming_child = Key("incoming-child", "new")
+        self.history.bind([incoming, incoming_child])
+        dram = {incoming: 2, incoming_child: 1, self.root: 1}
+        disk = {self.root: 1, self.child: 1}
+        decision = self.decision(dram, disk, capacity=2, eligible={incoming}, pinned={self.child})
+        self.assertIsNone(decision)
 
     def test_request_clock_deduplicates_retries(self):
         self.history.observe("session", "1")

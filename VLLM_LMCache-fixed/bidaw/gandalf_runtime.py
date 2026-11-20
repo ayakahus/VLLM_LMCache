@@ -203,7 +203,8 @@ def reclaim(manager, budget, decision, success_code):
     key = decision.key
     record_tier_event("tier_decision", key, action=decision.action,
                       drop_cost=decision.drop_cost, write_cost=decision.write_cost,
-                      replacement_cost=decision.replacement_cost, victims=len(decision.victims))
+                      replacement_cost=decision.replacement_cost, victims=len(decision.victims),
+                      drop_score=decision.drop_score, move_score=decision.move_score)
     if decision.action != "drop":
         reservation = manager.reserve_read([key]).get(key)
         if reservation is None or reservation[0] != success_code or reservation[1] is None:
