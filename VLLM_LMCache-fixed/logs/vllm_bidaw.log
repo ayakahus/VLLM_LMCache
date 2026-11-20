@@ -1574,3 +1574,28 @@ INFO:     127.0.0.1:47004 - "POST /v1/completions HTTP/1.1" 200 OK
 (APIServer pid=2828278) INFO 11-19 14:34:14 [loggers.py:335] Engine 000: Avg prompt throughput: 42.0 tokens/s, Avg generation throughput: 11.7 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, External prefix cache hit rate: 77.0%
 (APIServer pid=2828278) INFO 11-19 14:34:14 [metrics.py:108] KV Transfer metrics: LMCache MP lookup count=2, LMCache MP lookup avg latency (ms)=14.212
 (APIServer pid=2828278) INFO 11-19 14:34:24 [loggers.py:335] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, External prefix cache hit rate: 77.0%
+(APIServer pid=2828278) INFO 11-20 17:09:00 [launcher.py:256] [shutdown] API server: shutdown triggered
+(APIServer pid=2828278) INFO 11-20 17:09:00 [launcher.py:272] [shutdown] API server: stopping engine client mode=abort timeout=0s
+(APIServer pid=2828278) INFO 11-20 17:09:00 [core_client.py:792] [shutdown] MPClient: start timeout=0s
+(APIServer pid=2828278) INFO 11-20 17:09:00 [core_client.py:794] [shutdown] MPClient: stopping engine manager
+(APIServer pid=2828278) INFO 11-20 17:09:00 [utils.py:628] [shutdown] Process manager: send sigterm to process EngineCore
+(APIServer pid=2828278) WARNING 11-20 17:09:00 [utils.py:648] [shutdown] Process manager: force killing remaining processes count=1
+(APIServer pid=2828278) WARNING 11-20 17:09:00 [utils.py:653] [shutdown] Process manager: force killing remaining process EngineCore pid 2828646
+(EngineCore pid=2828646) INFO 11-20 17:09:00 [core.py:1525] [shutdown] EngineCore: trigger received signal=SIGTERM
+(EngineCore pid=2828646) INFO 11-20 17:09:00 [core.py:1712] [shutdown] EngineCore: start mode=abort timeout=0s
+(EngineCore pid=2828646) INFO 11-20 17:09:00 [core.py:1743] [shutdown] EngineCore: request processing complete; starting resource teardown
+(EngineCore pid=2828646) INFO 11-20 17:09:00 [core.py:1573] [shutdown] EngineCore: exiting busy loop
+[32;20m[2026-11-20 17:09:00,056] LMCache INFO:[0m Stopping PeriodicThread: lmcache-heartbeat [3m(periodic_thread.py:276:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-20 17:09:00,057] LMCache INFO:[0m PeriodicThread lmcache-heartbeat loop stopped [3m(periodic_thread.py:382:lmcache.v1.periodic_thread)[0m
+[32;20m[2026-11-20 17:09:00,057] LMCache INFO:[0m Unregistering kv caches [3m(vllm_multi_process_adapter.py:2464:lmcache.integration.vllm.vllm_multi_process_adapter)[0m
+(APIServer pid=2828278) INFO 11-20 17:09:00 [core_client.py:796] [shutdown] MPClient: engine manager stopped
+(APIServer pid=2828278) INFO 11-20 17:09:00 [core_client.py:797] [shutdown] MPClient: cleaning up background resources
+(APIServer pid=2828278) INFO 11-20 17:09:00 [core_client.py:799] [shutdown] MPClient: complete
+(APIServer pid=2828278) INFO 11-20 17:09:00 [launcher.py:281] [shutdown] API server: engine client stopped
+(APIServer pid=2828278) INFO 11-20 17:09:00 [launcher.py:284] [shutdown] API server: signalling HTTP server shutdown
+(APIServer pid=2828278) INFO 11-20 17:09:00 [launcher.py:306] [shutdown] API server: shutting down FastAPI HTTP server
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+/home/fzz27/anaconda3/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
