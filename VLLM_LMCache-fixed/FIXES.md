@@ -200,3 +200,50 @@ python3 bidaw/l2_fate_report.py
 
 共享模式下，B 类等到全局回放结束标记，再检查写入后是否有任何对话查询或读取同一对象。
 该标记表示本次回放的观察窗口结束。报告的 B 类仅覆盖这个窗口，回放跳过或截断的轮次没有产生查询证据。
+
+## Gandalf 第一阶段与四组基准
+
+第一阶段使用 Qwen2.5-1.5B 的单 rank、单全注意力 KV group。新 KV 先放入
+DRAM。Gandalf 在 L1 达到淘汰水位时，比较可释放对象的预期重算、SSD 写入磨损和
+置换损失。采取迁移时，从 SSD 已有前缀的边界向后写。丢弃与 SSD 置换从叶子开始，
+迁移写失败会保留 L1 对象。SSD 满时，置换成本按本次实际需要移除的所有 L2 副本计算，
+同一对象在 L1 还有副本时不计其重算损失。
+
+在线预测只使用已经观察到的请求。首版用以请求数计的有限回访窗口和经验概率估计，
+并按对象大小和空闲请求数归一化成本。候选集使用直接扫描。磨损参数请按实际硬件校准。
+论文的混合注意力状态放置和惰性候选堆留待下一阶段。
+
+| 组 | L1 淘汰与 L2 写入 | 调度 |
+| --- | --- | --- |
+| `lru` | LRU，L1 写完后异步复制 | FCFS |
+| `lru_writeback` | LRU，L1 淘汰时写回 | FCFS |
+| `bidaw` | Bidaw，L1 写完后异步复制 | 开启双队列 |
+| `gandalf` | Gandalf，L1 有压力时选择性写回 | FCFS |
+
+用仓库固定版本的 vLLM 0.33.0、LMCache 0.5.7.post1、已下载的模型和一张可见的
+NVIDIA GPU。服务使用 5555、8080、8000，运行前保持这三个端口空闲。用本地 NVMe
+路径作为 `GANDALF_CACHE_ROOT`。脚本为每组创建全新的 L2 目录，保留原始结果和缓存文件。
+
+```bash
+bash run_gandalf_benchmark.sh --plan
+CUDA_VISIBLE_DEVICES=0 GANDALF_CACHE_ROOT=/mnt/nvme/gandalf \
+  GANDALF_USERS=35 bash run_gandalf_benchmark.sh
+CUDA_VISIBLE_DEVICES=0 GANDALF_CACHE_ROOT=/mnt/nvme/gandalf \
+  GANDALF_REPEATS=3 bash run_gandalf_benchmark.sh
+```
+
+默认 70 个会话、20 倍时间压缩、并发 64、1 GiB L1、2 GiB L2。可用
+`GANDALF_USERS`、`GANDALF_SPEED`、`GANDALF_PARALLEL`、`GANDALF_L1_GB`、
+`GANDALF_L2_BYTES`、`GANDALF_SEED` 和 `GANDALF_REPEATS` 调整。各组使用同一
+固定回答历史，关闭填充尾块和跨会话共享，从首条回放请求开始计量。重复运行会轮换组顺序。
+
+门控默认 `GANDALF_ALPHA=1`、`GANDALF_RETURN_HORIZON=128`（请求数）、
+`GANDALF_RECOMPUTE_COST=0.00002`（每个重算 chunk 的示例价格）、
+`GANDALF_SSD_PRICE=100` 和 `GANDALF_SSD_TBW_BYTES=6e14`。
+通过 `GANDALF_TARGET_DAYS` 启用随累计写入调节的寿命目标，默认 0 时仅使用静态写入价格。
+
+输出在 `logs/gandalf_benchmarks/run.*/` 下。报告要求四组实际 prompt 指纹、请求数和
+容量一致，交叉核对 FS 成功写入事件与适配器计数。每组保留服务状态、回放 JSON、vLLM
+指标快照和 L2 事件。比较报告包含 TTFT 和端到端 P50/P95/P99、FS 写入次数和字节、
+每千请求写入量、L1/L2 连续前缀命中、LMCache 未命中 token 和 vLLM 本地 prefill token。
+本地 prefill 包括新输入与历史重算；FS 写入统计反映主机侧 KV 写入量。

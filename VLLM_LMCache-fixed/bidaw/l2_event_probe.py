@@ -35,6 +35,11 @@ def record_preparing_dispatch(controller, request_id):
         _log("preparing", [_request_fields(controller, request_id)])
 
 
+def record_tier_event(event, key, **fields):
+    if _log is not None:
+        _log(event, [{**_key_fields(key), **fields}])
+
+
 def _request_fields(controller, request_id):
     return {"request": f"{id(controller)}:{request_id}"}
 
@@ -144,7 +149,11 @@ def apply_l2_event_probe() -> bool:
         return removed_keys, sizes
 
     def l1_action(self, action):
-        token = l1_evicting.set((self._l1_manager, self._eviction_policy.name))
+        policy = self._eviction_policy.name
+        bounded = getattr(self, "_gandalf_budget", None)
+        if bounded is not None and bounded.settings.mode != "write_through":
+            policy = bounded.settings.mode
+        token = l1_evicting.set((self._l1_manager, policy))
         try:
             return evict_l1(self, action)
         finally:

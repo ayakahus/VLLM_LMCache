@@ -171,6 +171,10 @@ def apply_all() -> None:
     _patch_http()
     if os.environ.get("BIDAW_FORCE_POLICY") == "Bidaw":
         _patch_conversation_lookup()
+    if "GANDALF_TIER_MODE" in os.environ:
+        from bidaw.gandalf_runtime import apply_tiering
+
+        apply_tiering()
     _patch_l2_event_probe()
     _patch_dual_queue()
     _patch_watermark()

@@ -69,4 +69,9 @@ def bidaw_status() -> dict[str, Any]:
         status["scheduler"] = scheduler_snapshot()
     except Exception:  # noqa: BLE001
         pass
+    from bidaw.gandalf_runtime import status as tier_status
+
+    tier = tier_status()
+    if tier is not None:
+        status["tier_policy"] = tier
     return status

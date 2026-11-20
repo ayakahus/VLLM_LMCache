@@ -15,6 +15,7 @@ set -euo pipefail
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${DEMO_DIR}/lmcache_geometry.sh"
+LMCACHE_L2_PATH="${BIDAW_L2_DIR:-$LMCACHE_L2_PATH}"
 # shellcheck disable=SC1091
 source "${DEMO_DIR}/env.sh"
 
@@ -29,6 +30,7 @@ export BIDAW_L1_CAPACITY_KEYS="${BIDAW_L1_CAPACITY_KEYS:-$(python3 -c \
 export BIDAW_EVICTION_WATERMARK="${BIDAW_EVICTION_WATERMARK:-0.95}"
 EVICTION_POLICY="${EVICTION_POLICY:-Bidaw}"
 mkdir -p "${DEMO_DIR}/logs" "$LMCACHE_L2_PATH"
+l2_adapter=$(python3 -c 'import json,sys; print(json.dumps(dict(type="fs", base_path=sys.argv[1])))' "$LMCACHE_L2_PATH")
 
 export LMCACHE_LOG_LEVEL="${LMCACHE_LOG_LEVEL:-INFO}"
 printf '[lmcache] chunk=256 tokens, padded_tail=%s, bidaw_capacity=%s keys, L2=%s\n' \
@@ -42,4 +44,4 @@ exec python3 -m bidaw.lmcache_server_entry server \
     --l1-size-gb "$L1_GB" \
     --eviction-policy "$EVICTION_POLICY" \
     --l2-prefetch-policy retain \
-    --l2-adapter "{\"type\":\"fs\",\"base_path\":\"$LMCACHE_L2_PATH\"}"
+    --l2-adapter "$l2_adapter"
