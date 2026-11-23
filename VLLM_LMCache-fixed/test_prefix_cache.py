@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import time
 from typing import Any
+from uuid import uuid4
 
 import requests
 
@@ -36,9 +38,7 @@ MODEL = "qwen2.5-1.5b-instruct"
 # 公共长前缀: 由固定文本重复拼接 + 本次运行唯一 ID, ~1900 token,
 # 保证"同一运行内的多个请求"共享前缀, 而"多次运行之间"前缀互不相同
 # (否则上一次运行的缓存会污染本次的 COLD 基线)。
-import uuid
-
-RUN_ID = uuid.uuid4().hex[:8]
+RUN_ID = uuid4().hex[:8]
 _PREFIX_SENTENCE = (
     f"[run-{RUN_ID}] "
     "The LMCache system stores the key-value cache of large language models "
@@ -52,11 +52,11 @@ def build_prompt(question: str) -> str:
     return f"{LONG_PREFIX}\n\nQuestion: {question}\nAnswer:"
 
 
-def stream_completion(base_url: str, prompt: str, max_tokens: int = 32) -> tuple[str, float]:
+def stream_completion(base_url: str, prompt: str, max_tokens: int = 32, *, model=MODEL) -> tuple[str, float]:
     """流式请求 /v1/completions, 返回 (文本, TTFT 秒)。"""
     url = f"{base_url}/v1/completions"
     payload = {
-        "model": MODEL,
+        "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -164,12 +164,124 @@ def pick_metrics(text: str) -> list[str]:
     return out
 
 
+def wait_for_evidence(path, condition, label, timeout=90):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file():
+            with path.open(encoding="utf-8") as stream:
+                events = [json.loads(line) for line in stream if line.strip() and line.endswith("\n")]
+            result = condition(events)
+            if result:
+                return result
+        time.sleep(0.25)
+    raise RuntimeError(f"Timed out waiting for {label} in {path}")
+
+
+def smoke_objects(events, kind, salt, turn, model, group_ids):
+    """Address each object by rank and hash so unrelated group matches cannot pass."""
+    objects = {group_id: set() for group_id in group_ids}
+    for event in events:
+        if (event["event"] != kind or event["salt"] != salt
+                or event["turn"] != turn or event["model"] != model):
+            continue
+        if kind == "retrieve" and not event["complete"]:
+            continue
+        for group_id in group_ids:
+            objects[group_id].update((event["rank"], key) for key in event["groups"].get(group_id, []))
+    return objects
+
+
+def reset_local_prefix_cache(vllm):
+    deadline = time.monotonic() + 30
+    url = f"{vllm}/reset_prefix_cache"
+    while time.monotonic() < deadline:
+        response = requests.post(url, params={"reset_external": "false", "reset_running_requests": "false"},
+                                 timeout=5)
+        response.raise_for_status()
+        if response.json().get("success") is True:
+            return
+        time.sleep(0.25)
+    raise RuntimeError("Could not clear vLLM's local prefix cache after round 1")
+
+
+def hybrid_smoke(args):
+    from bidaw.hybrid_smoke_probe import SMOKE_SALT_PREFIX
+    from bidaw.trace_replay import stream_ttft
+    from transformers import AutoTokenizer
+
+    def latest_layout(events):
+        return next((event for event in reversed(events) if event["event"] == "layout"), None)
+
+    for endpoint in (f"{args.vllm}/v1/models", f"{args.lmcache}/healthcheck"):
+        requests.get(endpoint, timeout=10).raise_for_status()
+    layout = wait_for_evidence(args.hybrid_evidence, latest_layout, "registered layout")
+    print(json.dumps(layout, indent=2), flush=True)
+    kinds = layout["group_kinds"]
+    windows = layout["num_chunks_in_sw"]
+    group_ids = {
+        str(index) for index, (kind, window) in enumerate(zip(kinds, windows, strict=True))
+        if kind == "recurrent" or (kind == "attention" and window < 0)
+    }
+    if (layout["world_size"] != 1
+            or not any(kind == "recurrent" and window == 1 for kind, window in zip(kinds, windows, strict=True))
+            or not any(kind == "attention" and window < 0 for kind, window in zip(kinds, windows, strict=True))):
+        raise RuntimeError("Expected one rank with full-attention and one-chunk recurrent groups")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
+    encode = lambda text: tokenizer.encode(text, add_special_tokens=False)
+    salt = SMOKE_SALT_PREFIX + uuid4().hex
+    turn1, turn2 = f"{salt}-1", f"{salt}-2"
+    target = 3 * layout["chunk_size"]
+    prefix = encode(LONG_PREFIX)
+    if not prefix:
+        raise RuntimeError("Tokenizer returned an empty test prefix")
+    prefix = (prefix * ((target + len(prefix) - 1) // len(prefix)))[:target]
+    prompt1 = prefix + encode("\nQuestion: What does LMCache store?\nAnswer:")
+    result1 = stream_ttft(args.vllm, prompt1, salt, args.max_tokens, args.model, round_id=turn1)
+
+    def stored_groups(events):
+        groups = smoke_objects(events, "store", salt, turn1, layout["model"], group_ids)
+        return groups if all(groups.values()) else None
+
+    stored = wait_for_evidence(args.hybrid_evidence, stored_groups, "round 1 STORE for every group")
+    print("Round 1 STORE counts:", {g: len(keys) for g, keys in sorted(stored.items())}, flush=True)
+    reset_local_prefix_cache(args.vllm)
+
+    prompt2 = prompt1 + result1["completion_token_ids"] + encode("\nQuestion: Why reuse it?\nAnswer:")
+    result2 = stream_ttft(args.vllm, prompt2, salt, args.max_tokens, args.model, round_id=turn2)
+
+    def reused_groups(events):
+        # More STORE callbacks from the first round may have arrived after its first group commit.
+        expected = smoke_objects(events, "store", salt, turn1, layout["model"], group_ids)
+        retrieved = smoke_objects(events, "retrieve", salt, turn2, layout["model"], group_ids)
+        matched = {g: expected[g] & retrieved[g] for g in group_ids}
+        return matched if all(matched.values()) else None
+
+    matched = wait_for_evidence(args.hybrid_evidence, reused_groups, "round 2 RETRIEVE of round 1 objects")
+    print("Round 2 RETRIEVE counts:", {g: len(keys) for g, keys in sorted(matched.items())})
+    print(f"PASS: all groups reused across turns; TTFT {result1['ttft_s'] * 1000:.1f} ms / "
+          f"{result2['ttft_s'] * 1000:.1f} ms")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="vLLM+LMCache KV 复用验证")
     ap.add_argument("--vllm", default=DEFAULT_VLLM)
     ap.add_argument("--lmcache", default=DEFAULT_LMC)
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--model-dir", type=Path, help="Local tokenizer/model for the two-turn smoke")
+    ap.add_argument("--hybrid-evidence", type=Path, help="JSONL from bidaw.hybrid_smoke_probe")
     args = ap.parse_args()
+
+    if args.hybrid_evidence:
+        if not args.model_dir:
+            ap.error("--hybrid-evidence requires --model-dir")
+        try:
+            return hybrid_smoke(args)
+        except (OSError, ValueError, RuntimeError, requests.RequestException) as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 2
 
     print("=" * 78)
     print("vLLM + LMCache 独立 Server — KV Cache 复用验证")
@@ -192,7 +304,7 @@ def main() -> int:
     print(f"\n[基线] LMCache 已完成 STORE 次数: {baseline}")
 
     print("\n--- 第 1 步 / COLD: 首次请求 (完整 prefill, 并把 KV 存入 LMCache) ---")
-    text1, ttft1 = stream_completion(args.vllm, phase1_prompt, args.max_tokens)
+    text1, ttft1 = stream_completion(args.vllm, phase1_prompt, args.max_tokens, model=args.model)
     print(f"TTFT = {ttft1 * 1000:8.1f} ms   输出: {text1[:80]!r}")
 
     stored = wait_for_store(args.lmcache, baseline)
@@ -201,12 +313,12 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n--- 第 2 步 / WARM: 相同前缀 + 不同问题 (KV 应从 LMCache 检索回来) ---")
     warm_prompt = build_prompt("List the two main benefits of caching KV, in a few words.")
-    text2, ttft2 = stream_completion(args.vllm, warm_prompt, args.max_tokens)
+    text2, ttft2 = stream_completion(args.vllm, warm_prompt, args.max_tokens, model=args.model)
     print(f"TTFT = {ttft2 * 1000:8.1f} ms   输出: {text2[:80]!r}")
 
     # ------------------------------------------------------------------
     print("\n--- 第 3 步 / WARM2: 与首次完全相同的请求, 再测一次 ---")
-    text3, ttft3 = stream_completion(args.vllm, phase1_prompt, args.max_tokens)
+    text3, ttft3 = stream_completion(args.vllm, phase1_prompt, args.max_tokens, model=args.model)
     print(f"TTFT = {ttft3 * 1000:8.1f} ms   输出: {text3[:80]!r}")
 
     # ------------------------------------------------------------------

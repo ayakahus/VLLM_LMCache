@@ -269,3 +269,26 @@ python3 -m bidaw.gandalf_fate_report logs/gandalf_benchmarks/run.XXXXXXXX
 C 要求该次物理写入实际发生过 I/O 读取尝试和成功读回，随后同一请求对同一对象记录
 L2 命中。C 的判定独立于淘汰策略和调度路径。A、B 仍使用前文的回放证据，
 其余写入归 U。原有 `bidaw.l2_fate_report` 继续使用 Bidaw 专用判据。
+
+## 混合注意力两轮冒烟
+
+在有一张可见 NVIDIA GPU 的机器上，使用固定版本的 vLLM 0.33.0、LMCache 0.5.7.post1
+和已下载的 Qwen3.5-0.8B。保持 5555、8080、8000 端口空闲。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash run_hybrid_smoke.sh /path/to/Qwen3.5-0.8B
+```
+
+脚本启动原生 `LMCacheMPConnector`，vLLM 使用 `--language-model-only`、
+`--enable-prefix-caching` 和 `--mamba-cache-mode align`，LMCache 使用
+`--separate-object-groups`。Qwen3.5-0.8B 的默认 chunk 是 544 tokens。
+`HYBRID_CHUNK_SIZE` 可按实际 vLLM 块几何调整。冒烟使用 L1 DRAM。
+
+`test_prefix_cache.py` 的 `--hybrid-evidence` 模式发出两轮请求，第二轮使用首轮的
+实际回答 token。首轮等待各组成功提交 STORE，然后用 `reset_external=false` 清空
+vLLM 本地前缀缓存。第二轮必须在所有 full-attention 和 recurrent 组观察到至少一个
+与首轮 STORE 同 rank、同组、同 hash 的已完成 H2D RETRIEVE 才通过。
+
+服务和测试输出位于 `logs/hybrid_smoke/run.*/`，其中 `evidence.jsonl` 记录
+`find_attn_desc()` 的 `group_kinds`、`num_chunks_in_sw`，以及每组的逻辑
+tokens/block、每个 LMCache chunk 包含的引擎块数和字节数。
