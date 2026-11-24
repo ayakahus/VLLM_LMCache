@@ -52,6 +52,9 @@ if [[ "${VLLM_WITHOUT_LMCACHE:-0}" != "1" ]]; then
         # The scheduler checks this LMCache instance supports padded writes.
         CONNECTOR_CONFIG='{"kv_connector":"BidawPaddedTailConnector","kv_connector_module_path":"bidaw.padded_tail_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true,"lmcache.mp.mp_transfer_mode":"lmcache_driven"}}'
     fi
+    if [[ -n "${BIDAW_VLLM_TIMING_LOG:-}" && "$CONNECTOR_CONFIG" != *BidawPaddedTailConnector* ]]; then
+        CONNECTOR_CONFIG='{"kv_connector_module_path":"bidaw.vllm_timing_connector",'"${CONNECTOR_CONFIG:1}"
+    fi
     KV_ARGS=(--kv-transfer-config "$CONNECTOR_CONFIG"
              --scheduler-cls bidaw.vllm_arrival_scheduler.BidawScheduler)
 fi

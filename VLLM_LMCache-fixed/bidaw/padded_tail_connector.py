@@ -4,7 +4,6 @@ from importlib.metadata import version
 from urllib.request import urlopen
 from uuid import uuid4
 
-from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
 from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPRequestMetadata
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
@@ -18,6 +17,7 @@ from bidaw.padded_tail import (
     TAIL_VALID_TOKENS,
     make_padded_tail,
 )
+from bidaw.vllm_timing_connector import LMCacheMPConnector
 
 
 class BidawPaddedTailConnector(LMCacheMPConnector):

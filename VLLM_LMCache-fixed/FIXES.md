@@ -289,3 +289,25 @@ vLLM 本地前缀缓存。第二轮必须在所有 full-attention 和 recurrent 
 服务和测试输出位于 `logs/hybrid_smoke/run.*/`，其中 `evidence.jsonl` 记录
 `find_attn_desc()` 的 `group_kinds`、`num_chunks_in_sw`，以及每组的逻辑
 tokens/block、每个 LMCache chunk 包含的引擎块数和字节数。
+
+## TTFT 分项和后台写入延迟
+
+四组基准自动给 vLLM 设置 `BIDAW_VLLM_TIMING_LOG`，在每个实验组目录写入
+`vllm_timing.jsonl`。独立运行仓库的启动脚本时也可设置该变量。
+LMCache 由 `BIDAW_L2_EVENT_LOG` 开启新增的传输和淘汰事件，原有探针版本仍为 v4。
+
+```bash
+python3 -m bidaw.ttft_breakdown <run_root>
+```
+
+报告输出为 `ttft_breakdown.txt`、`ttft_breakdown.json` 和 `ttft_breakdown.png`。
+它汇总多个 `repeat-*` 的原始样本和 Prometheus 直方图差值。旧实验缺少的分项标为
+`n/a`。直方图分位数根据桶边界估算，原始队列时间与扣除 lookup 和 KV load 等待后的
+调度队列时间分别列出。两张表各自使用实际观测到的样本，后台写入和淘汰与请求 TTFT 分开展示。
+
+LMCache-driven 的传输计时从服务端处理入口到设备流完成回调被分发，包含回调分发延迟。
+engine-driven 的计时从 prepare 入口到 worker commit，包含 RPC 和序列化开销。
+`reserve_ms` 统计同一次 STORE 的 DRAM 预留调用，`alloc_failed` 使用 LMCache
+原生的 STORE 内存分配失败事件。vLLM 的 HBM 等待时间从 worker 提交实际 STORE 到
+`get_finished()` 观察到对应 future 已完成。DRAM 淘汰计时覆盖执行阶段，
+LRU write-back 在执行前的策略选块另列为 `selection_ms`。

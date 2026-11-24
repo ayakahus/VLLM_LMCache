@@ -174,7 +174,7 @@ run_arm() {
     wait_ready http://127.0.0.1:8080/healthcheck "$lmcache_pid" "$out/lmcache.log"
     curl -fsS http://127.0.0.1:8080/bidaw/status >"$out/status-before.json"
 
-    setsid bash ./start_vllm.sh >"$out/vllm.log" 2>&1 &
+    BIDAW_VLLM_TIMING_LOG="$out/vllm_timing.jsonl" setsid bash ./start_vllm.sh >"$out/vllm.log" 2>&1 &
     vllm_pid=$!
     wait_ready http://127.0.0.1:8000/v1/models "$vllm_pid" "$out/vllm.log"
     curl -fsS http://127.0.0.1:8000/metrics >"$out/vllm-metrics-before.txt"

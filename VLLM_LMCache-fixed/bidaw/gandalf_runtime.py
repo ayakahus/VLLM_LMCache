@@ -13,7 +13,7 @@ from threading import Lock
 import time
 
 from bidaw.gandalf_policy import Block, Decision, History, choose
-from bidaw.l2_event_probe import record_tier_event
+from bidaw.l2_event_probe import l1_cycle_active, record_l1_cycle_phase, record_tier_event
 
 LOGGER = logging.getLogger(__name__)
 _STORAGE = None
@@ -129,6 +129,7 @@ class BoundedFS:
 
     def _write_file(self, key, data):
         final, temporary = self.adapter._key_to_file_and_tmp_path(key)
+        started = time.monotonic_ns() if l1_cycle_active() else None
         try:
             if self.adapter._use_odirect:
                 self.adapter._write_with_odirect(temporary, data)
@@ -140,6 +141,8 @@ class BoundedFS:
                 raise OSError(f"Unexpected size for {temporary}")
             temporary.replace(final)
         finally:
+            if started is not None:
+                record_l1_cycle_phase("ssd_write_ms", (time.monotonic_ns() - started) / 1e6)
             temporary.unlink(missing_ok=True)
 
     async def admit(self, key, data, victims=None, *, can_move=None):
@@ -394,6 +397,7 @@ def apply_tiering():
                 decision = choose(dram, eligible, disk, pinned, settings.capacity, history,
                                   settings.recompute_price, budget.write_price, settings.alpha)
                 selection_ms = (time.perf_counter() - started) * 1000
+                record_l1_cycle_phase("selection_ms", selection_ms)
                 if decision is None:
                     break
                 attempted.add(decision.key)
