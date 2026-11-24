@@ -1,0 +1,22 @@
+SSD write fates
+
+A  All observed later lookups hit DRAM
+B1  No later reuse in the completed observation window
+B2  SSD copy removed before the first DRAM miss
+B3  SSD copy present at the first DRAM miss without an effective readback
+C  Confirmed SSD readback followed by a matching L2 hit
+U  Incomplete evidence or observation window
+
+| Run | Writes | A | B1 | B2 | B3 | C | U |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| repeat-1/lru | 181 | 10 (5.5%) | 139 (76.8%) | 0 (0.0%) | 0 (0.0%) | 2 (1.1%) | 30 (16.6%) |
+| repeat-1/lru_writeback | 132 | 0 (0.0%) | 118 (89.4%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 14 (10.6%) |
+| repeat-1/bidaw | 204 | 2 (1.0%) | 164 (80.4%) | 0 (0.0%) | 4 (2.0%) | 0 (0.0%) | 34 (16.7%) |
+| repeat-1/gandalf | 104 | 0 (0.0%) | 94 (90.4%) | 0 (0.0%) | 2 (1.9%) | 2 (1.9%) | 6 (5.8%) |
+
+| Run | Write bytes | A | B1 | B2 | B3 | C | U |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| repeat-1/lru | 2,112,878,592 | 131,343,360 (6.2%) | 1,638,632,448 (77.6%) | 0 (0.0%) | 0 (0.0%) | 26,268,672 (1.2%) | 316,634,112 (15.0%) |
+| repeat-1/lru_writeback | 1,591,839,744 | 0 (0.0%) | 1,433,757,696 (90.1%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 158,082,048 (9.9%) |
+| repeat-1/bidaw | 2,679,404,544 | 26,268,672 (1.0%) | 2,154,031,104 (80.4%) | 0 (0.0%) | 52,537,344 (2.0%) | 0 (0.0%) | 446,567,424 (16.7%) |
+| repeat-1/gandalf | 1,365,970,944 | 0 (0.0%) | 1,247,526,912 (91.3%) | 0 (0.0%) | 26,268,672 (1.9%) | 26,268,672 (1.9%) | 65,906,688 (4.8%) |
