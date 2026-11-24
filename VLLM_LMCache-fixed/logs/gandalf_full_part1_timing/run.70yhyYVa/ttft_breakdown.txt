@@ -1,0 +1,89 @@
+## TTFT critical path (ms)
+
+| Arm | Metric | Samples | mean | p50 | p95 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| lru | Client TTFT | 1299 | 124.686 | 98.199 | 304.608 | 548.120 |
+| lru | Server TTFT | 1299 | 114.155 | 89.598 | 326.562 | 535.893 |
+| lru | vLLM prefill | 1299 | 52.277 | 150.930 | 286.766 | 298.840 |
+| lru | LMCache lookup | 1299 | 28.641 | 21.555 | 73.852 | 207.186 |
+| lru | SSD → DRAM object read | 195 | 15.069 | 12.772 | 35.500 | 43.121 |
+| lru | SSD read time per request | 1299 | 0.863 | 0.000 | 7.116 | 18.402 |
+| lru | LMCache prefetch lookup → hit | 425 | 9.741 | 7.562 | 27.955 | 45.349 |
+| lru | DRAM → GPU RETRIEVE | 425 | 20.823 | 13.489 | 49.387 | 134.928 |
+| lru | GPU scheduling queue | 1299 | 0.977 | 0.498 | 1.254 | 3.934 |
+| lru | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a |
+| lru | vLLM queue (raw) | 1299 | 46.943 | 151.871 | 288.554 | 340.133 |
+| lru_writeback | Client TTFT | 1299 | 144.691 | 134.368 | 268.142 | 375.284 |
+| lru_writeback | Server TTFT | 1299 | 134.641 | 137.939 | 284.418 | 462.363 |
+| lru_writeback | vLLM prefill | 1299 | 64.332 | 150.231 | 285.439 | 297.458 |
+| lru_writeback | LMCache lookup | 1299 | 33.590 | 28.777 | 87.327 | 195.050 |
+| lru_writeback | SSD → DRAM object read | 310 | 9.827 | 7.885 | 19.877 | 29.833 |
+| lru_writeback | SSD read time per request | 1299 | 1.077 | 0.000 | 7.621 | 14.559 |
+| lru_writeback | LMCache prefetch lookup → hit | 400 | 10.918 | 10.035 | 23.298 | 34.361 |
+| lru_writeback | DRAM → GPU RETRIEVE | 400 | 26.391 | 23.840 | 60.170 | 88.003 |
+| lru_writeback | GPU scheduling queue | 1299 | 1.044 | 0.617 | 1.485 | 2.042 |
+| lru_writeback | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a |
+| lru_writeback | vLLM queue (raw) | 1299 | 53.869 | 150.696 | 286.323 | 298.378 |
+| bidaw | Client TTFT | 1299 | 134.167 | 118.351 | 264.513 | 385.727 |
+| bidaw | Server TTFT | 1299 | 125.650 | 121.696 | 257.885 | 457.731 |
+| bidaw | vLLM prefill | 1299 | 60.184 | 150.000 | 285.000 | 297.000 |
+| bidaw | LMCache lookup | 1299 | 32.362 | 23.151 | 86.386 | 200.045 |
+| bidaw | SSD → DRAM object read | 386 | 22.264 | 13.909 | 52.629 | 56.188 |
+| bidaw | SSD read time per request | 1299 | 2.184 | 0.000 | 11.856 | 31.514 |
+| bidaw | LMCache prefetch lookup → hit | 344 | 16.690 | 10.875 | 45.821 | 74.153 |
+| bidaw | DRAM → GPU RETRIEVE | 344 | 13.678 | 10.801 | 32.698 | 55.401 |
+| bidaw | GPU scheduling queue | 1299 | 1.471 | 0.441 | 4.039 | 7.749 |
+| bidaw | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a |
+| bidaw | vLLM queue (raw) | 1299 | 46.668 | 150.463 | 285.880 | 297.917 |
+| gandalf | Client TTFT | 1299 | 171.729 | 143.285 | 395.483 | 547.049 |
+| gandalf | Server TTFT | 1299 | 164.038 | 153.652 | 443.689 | 583.472 |
+| gandalf | vLLM prefill | 1299 | 80.701 | 151.399 | 287.657 | 299.769 |
+| gandalf | LMCache lookup | 1299 | 39.763 | 29.305 | 151.181 | 236.830 |
+| gandalf | SSD → DRAM object read | 324 | 12.296 | 8.930 | 30.098 | 48.977 |
+| gandalf | SSD read time per request | 1299 | 1.387 | 0.000 | 9.117 | 23.279 |
+| gandalf | LMCache prefetch lookup → hit | 383 | 12.347 | 8.859 | 40.243 | 64.086 |
+| gandalf | DRAM → GPU RETRIEVE | 383 | 35.833 | 26.663 | 111.801 | 163.493 |
+| gandalf | GPU scheduling queue | 1299 | 1.214 | 0.364 | 3.390 | 6.874 |
+| gandalf | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a |
+| gandalf | vLLM queue (raw) | 1299 | 66.090 | 152.584 | 289.910 | 400.111 |
+
+## Background writes and eviction (ms)
+
+| Arm | Metric | Samples | mean | p95 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| lru | HBM → DRAM STORE | 246 | 26.008 | 124.101 | 217.544 |
+| lru | DRAM reservation | 1131 | 0.710 | 1.410 | 2.017 |
+| lru | HBM STORE submit → worker acknowledgement | 1051 | 36.867 | 121.917 | 236.092 |
+| lru | DRAM eviction execution | 84 | 1.463 | 2.791 | 4.114 |
+| lru | Eviction candidate selection | n/a | n/a | n/a | n/a |
+| lru | Migration SSD write | n/a | n/a | n/a | n/a |
+| lru_writeback | HBM → DRAM STORE | 287 | 27.071 | 63.755 | 132.909 |
+| lru_writeback | DRAM reservation | 1156 | 0.644 | 1.391 | 1.876 |
+| lru_writeback | HBM STORE submit → worker acknowledgement | 1062 | 52.943 | 118.335 | 170.212 |
+| lru_writeback | DRAM eviction execution | 103 | 75.633 | 122.353 | 135.747 |
+| lru_writeback | Eviction candidate selection | 103 | 0.123 | 0.177 | 0.220 |
+| lru_writeback | Migration SSD write | 103 | 32.063 | 72.396 | 73.791 |
+| bidaw | HBM → DRAM STORE | 297 | 16.107 | 55.217 | 92.261 |
+| bidaw | DRAM reservation | 1203 | 0.618 | 3.011 | 4.091 |
+| bidaw | HBM STORE submit → worker acknowledgement | 1073 | 33.133 | 87.544 | 132.040 |
+| bidaw | DRAM eviction execution | 93 | 2.296 | 6.420 | 8.434 |
+| bidaw | Eviction candidate selection | n/a | n/a | n/a | n/a |
+| bidaw | Migration SSD write | n/a | n/a | n/a | n/a |
+| gandalf | HBM → DRAM STORE | 309 | 37.672 | 133.259 | 201.689 |
+| gandalf | DRAM reservation | 1174 | 0.470 | 2.170 | 3.614 |
+| gandalf | HBM STORE submit → worker acknowledgement | 1086 | 72.622 | 175.400 | 265.278 |
+| gandalf | DRAM eviction execution | 111 | 161.327 | 221.593 | 252.370 |
+| gandalf | Eviction candidate selection | 111 | 44.591 | 59.180 | 68.033 |
+| gandalf | Migration SSD write | 111 | 53.237 | 77.973 | 82.998 |
+
+| Arm | Eviction cycles | STORE attempts observed | Allocation failures |
+| --- | ---: | ---: | ---: |
+| lru | 84 | 1131 | 878 |
+| lru_writeback | 103 | 1156 | 857 |
+| bidaw | 93 | 1203 | 896 |
+| gandalf | 111 | 1174 | 854 |
+
+Prometheus percentiles are bucket estimates for the full before/after snapshot window.
+SSD per-request time includes zeros for requests with no reported read.
+Overlapping object reads in one request are counted once in the amortized metric.
+Timings overlap and use different sample populations. The chart and tables do not sum components.
