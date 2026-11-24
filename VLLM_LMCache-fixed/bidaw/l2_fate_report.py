@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Classify physical FS L2 writes using explicit replay and cache events."""
 import json
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,31 +9,28 @@ from pathlib import Path
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 LABELS = {
     "A": "All observed later lookups hit DRAM",
-    "B": "No later reuse request in the completed observation window",
-    "C": "Bidaw eviction and preparing-queue readback",
-    "U": "Unresolved",
+    "B1": "No later reuse in the completed observation window",
+    "B2": "SSD copy removed before the first DRAM miss",
+    "B3": "SSD copy present at the first DRAM miss without an effective readback",
+    "C": "Confirmed SSD readback followed by a matching L2 hit",
+    "U": "Incomplete evidence or observation window",
 }
-
+REPORT_VERSION = 8
 
 @dataclass
 class Write:
     size: int
     session: str
     round_index: int | None
-    padded: bool
     key: tuple
     written_at: int
     shared_cache: bool = False
-    evicted_at: int = -1
-    eviction_policy: str | None = None
-    read_attempt: bool = False
-    pending_reads: dict[str, tuple[int, str | None]] = field(default_factory=dict)
+    pending_reads: dict[str, str | None] = field(default_factory=dict)
     load_events: int = 0
     load_requests: set[str] = field(default_factory=set)
     qualifying_requests: set[str] = field(default_factory=set)
-    closed: bool = False
-    lookups: set = field(default_factory=set)
-    unknown_lookup: bool = False
+    deleted_at: int | None = None
+    ambiguous_removal_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -122,174 +120,175 @@ def replay_rounds(events):
         elif salt in open_rounds or last_round.get(salt) != round_id or round_id not in finished_at:
             invalid.add(salt)
         else:
-            ended[salt] = scope.number
+            ended[salt] = index
     return round_at, ended, invalid, finished_at
 
 
-def classify(events, *, confirmed_readback=False):
-    """Classify writes using the original Bidaw or policy-neutral C criterion."""
+def observed_after(records, written_at, stop):
+    start = bisect_right(records, written_at, key=lambda record: record[0])
+    end = bisect_left(records, stop, lo=start, key=lambda record: record[0])
+    return records[start:end]
+
+
+def write_category(write, lookups, reads, l1_hits, unconfirmed_hits, events,
+                   ended, invalid, finished_at, shared_ends):
+    if write.qualifying_requests:
+        return "C"
+    if write.round_index is None or write.session in invalid:
+        return "U"
+    if write.shared_cache:
+        end = shared_ends[0] if len(shared_ends) == 1 else None
+    else:
+        end = ended.get(write.session)
+    stop = len(events) if end is None else end
+    post_lookups = {}
+    scoped_requests = set()
+    for index, request, context in observed_after(lookups, write.written_at, stop):
+        if context is None or context[1].session in invalid:
+            return "U"
+        round_id, scope = context
+        scoped_requests.add(request)
+        if scope.session != write.session or scope.number > write.round_index:
+            post_lookups.setdefault(request, (index, round_id))
+
+    if any(request not in scoped_requests or unmatched
+           for _, request, unmatched in observed_after(reads, write.written_at, stop)):
+        return "U"
+    if any(request in unconfirmed_hits for request in post_lookups):
+        return "U"
+    misses = post_lookups.keys() - l1_hits
+    if post_lookups and not misses:
+        return "A"
+    if end is None:
+        return "U"
+    if not post_lookups:
+        return "B1"
+    first_miss, round_id = min(post_lookups[request] for request in misses)
+    if not first_miss < finished_at.get(round_id, -1) < end:
+        return "U"
+    miss_time = events[first_miss]["t_ns"]
+    if write.deleted_at is not None and write.deleted_at < miss_time:
+        return "B2"
+    if write.ambiguous_removal_at is not None and write.ambiguous_removal_at < miss_time:
+        return "U"
+    return "B3"
+
+
+def classify(events):
+    """Classify each physical write, matching SSD reads to the copy that served them."""
     # Submission events may be written after a fast-lane result.
     events = sorted(events, key=lambda event: event["t_ns"])
     round_at, ended, invalid, finished_at = replay_rounds(events)
-    l1_hits = set()
-    l2_hits = {}
-    preparing = {}
-    shared_ends = []
-    for index, event in enumerate(events):
-        kind = event["ev"]
-        if kind == "preparing":
-            preparing[event["request"]] = index
-        elif kind == "shared_replay_end":
-            shared_ends.append(index)
-        elif kind == "l1_hit":
-            l1_hits.add((object_key(event), event["request"]))
-        elif kind == "l2_hit":
-            l2_hits[(object_key(event), event["request"])] = index
-
     classes = dict.fromkeys(LABELS, 0)
     byte_counts = dict.fromkeys(LABELS, 0)
     active = defaultdict(dict)
     writes = []
     seen = set()
-    lookups = {}
+    lookups = defaultdict(list)
+    reads = defaultdict(list)
+    l1_hits = defaultdict(set)
+    unconfirmed_hits = defaultdict(set)
     confirmed_sources = {}
-    # B considers subsequent requests for the exact key even after a copy closes.
-    last_scoped_lookup = {}
-    last_unscoped_lookup = {}
-    last_read = {}
+    shared_ends = []
     rewrites = loads = deletes = unattributed_loads = padded_tail_writes = 0
     legacy_touch_events = 0
 
     for index, event in enumerate(events):
         kind = event["ev"]
-        if confirmed_readback and kind == "l2_hit":
-            request = event["request"]
-            source = confirmed_sources.pop((object_key(event), request), None)
-            if source is not None:
-                source.qualifying_requests.add(request)
-            continue
-        if kind not in {"write", "lookup", "l1_evict", "l1_remove", "load_attempt", "load", "delete"}:
+        if kind == "shared_replay_end":
+            shared_ends.append(index)
+        if kind not in {"write", "lookup", "l1_hit", "l2_hit", "load_attempt", "load", "delete", "ssd_eviction"}:
             continue
         key = object_key(event)
-        copies = active[key] if kind == "write" else active.get(key, {})
         if kind == "lookup":
-            request_key = (key, event["request"])
-            context = round_at.get(index)
-            if context is not None and context[1].shared_cache and context[1].session in invalid:
-                context = None
-            if context is None:
-                last_unscoped_lookup[key] = index
+            lookups[key].append((index, event["request"], round_at.get(index)))
+            continue
+        if kind == "l1_hit":
+            l1_hits[key].add(event["request"])
+            continue
+        if kind == "l2_hit":
+            request = event["request"]
+            source = confirmed_sources.pop((key, request), None)
+            if source is None:
+                unconfirmed_hits[key].add(request)
             else:
-                last_scoped_lookup[key] = (index, context[1].number)
-            if context is not None and copies:
-                lookups.setdefault(request_key, (index, context[0]))
-            for write in copies.values():
-                if context is None or write.round_index is None:
-                    write.unknown_lookup = True
-                elif context[1].session != write.session or context[1].number > write.round_index:
-                    write.lookups.add(request_key)
-        elif kind == "l1_evict":
-            for write in copies.values():
-                write.evicted_at = index
-                write.eviction_policy = event["policy"]
-        elif kind == "l1_remove":
-            for write in copies.values():
-                write.evicted_at = -1
-                write.eviction_policy = None
-        elif kind == "write":
-            adapter = event["adapter"]
+                source.qualifying_requests.add(request)
+                unconfirmed_hits[key].discard(request)
+            continue
+
+        adapter = event.get("adapter")
+        copies = active[key] if kind == "write" else active.get(key, {})
+        if kind in {"delete", "ssd_eviction"}:
+            deletes += 1
+        if kind == "ssd_eviction" and adapter is None:
+            # Earlier bounded FS logs omit the adapter. The benchmark has one.
+            if len(copies) != 1:
+                for copy in copies.values():
+                    if copy.ambiguous_removal_at is None:
+                        copy.ambiguous_removal_at = event["t_ns"]
+                continue
+            adapter = next(iter(copies))
+        write = copies.get(adapter)
+        if kind == "write":
             padded = "tail_valid_tokens" in event
             padded_tail_writes += padded
             location = (key, adapter)
             rewrites += location in seen
             seen.add(location)
-            previous = copies.get(adapter)
-            if previous is not None:
-                previous.closed = True
-                previous.pending_reads.clear()
+            if write is not None:
+                write.deleted_at = event["t_ns"]
+                write.pending_reads.clear()
             context = round_at.get(index)
             scope = context[1] if context else None
             write = Write(event["bytes"], scope.session if scope else event["salt"],
-                          scope.number if scope else None, padded, key, index,
+                          scope.number if scope else None, key, index,
                           shared_cache=scope.shared_cache if scope else False)
             copies[adapter] = write
             writes.append(write)
-        elif kind in {"load_attempt", "load"}:
+        elif kind in {"delete", "ssd_eviction"}:
+            if write is not None:
+                write.deleted_at = event["t_ns"]
+                write.pending_reads.clear()
+                del copies[adapter]
+                if not copies:
+                    del active[key]
+        else:
             request = event.get("request")
             # Early version 3 logs have only the prefetch request ID.
             task = event.get("io_task") or request
-            if kind == "load" and task is None:
+            if kind == "load_attempt":
+                reads[key].append((index, request, False))
+                if write is not None and task is not None:
+                    write.pending_reads[task] = request
+                continue
+            if task is None:
                 # Older probes logged recency notifications as loads, with neither ID.
                 legacy_touch_events += 1
                 continue
-            last_read[key] = index
-            for write in copies.values():
-                write.read_attempt = True
-            write = copies.get(event["adapter"])
-            if kind == "load_attempt":
-                if write is not None and task is not None:
-                    write.pending_reads[task] = (index, request)
-                continue
             loads += 1
-            pending = write.pending_reads.pop(task, None) if write is not None else None
-            request_key = (key, request)
-            if confirmed_readback and request:
-                source = write if pending is not None and request == pending[1] else None
-                # A hit event identifies the request and object but not the
-                # adapter. Multiple different sources make attribution ambiguous.
+            matched = (write is not None and task in write.pending_reads
+                       and request == write.pending_reads.pop(task))
+            reads[key].append((index, request, not matched))
+            if request is not None:
+                source = write if matched else None
+                request_key = (key, request)
+                # A result identifies the request and object, but not the adapter.
                 if confirmed_sources.setdefault(request_key, source) is not source:
                     confirmed_sources[request_key] = None
-            if pending is None:
+            if not matched:
                 unattributed_loads += 1
                 continue
-            attempt, _ = pending
             write.load_events += 1
             if request is not None:
                 write.load_requests.add(request)
-            if (not confirmed_readback and not write.padded and request_key in write.lookups
-                    and write.eviction_policy == "bidaw_eviction_policy"):
-                submitted, round_id = lookups[request_key]
-                if (0 <= write.evicted_at < submitted
-                    < preparing.get(request, -1) < attempt < index
-                    < l2_hits.get(request_key, -1) < finished_at.get(round_id, -1)):
-                    write.qualifying_requests.add(request)
-        elif kind == "delete":
-            deletes += 1
-            write = copies.pop(event["adapter"], None)
-            if write is not None:
-                write.closed = True
-                write.pending_reads.clear()
-                if not copies:
-                    del active[key]
 
     effective_pairs = 0
     for write in writes:
-        if write.shared_cache:
-            observation_ended = len(shared_ends) == 1 and write.written_at < shared_ends[0]
-        else:
-            observation_ended = write.session in ended
-        valid_round = write.session not in invalid and write.round_index is not None
-        if write.qualifying_requests and (confirmed_readback or valid_round):
-            category = "C"
-            effective_pairs += len(write.qualifying_requests)
-        elif not valid_round:
-            category = "U"
-        elif (not write.read_attempt and not write.unknown_lookup
-              and write.lookups and write.lookups <= l1_hits
-              and (write.closed or observation_ended)):
-            category = "A"
-        elif observation_ended:
-            lookup_at, lookup_round = last_scoped_lookup.get(write.key, (-1, -1))
-            later_lookup = lookup_at > write.written_at and (
-                write.shared_cache or lookup_round > write.round_index
-            )
-            if (later_lookup or last_unscoped_lookup.get(write.key, -1) > write.written_at
-                    or last_read.get(write.key, -1) > write.written_at):
-                category = "U"
-            else:
-                category = "B"
-        else:
-            category = "U"
+        key = write.key
+        category = write_category(write, lookups[key], reads[key], l1_hits[key],
+                                  unconfirmed_hits[key], events, ended, invalid,
+                                  finished_at, shared_ends)
+        effective_pairs += len(write.qualifying_requests)
         classes[category] += 1
         byte_counts[category] += write.size
 
@@ -332,7 +331,7 @@ def main():
 
     marker, events = latest_run(args.log)
     report = {
-        "report_version": 7,
+        "report_version": REPORT_VERSION,
         "probe_version": marker["version"],
         "run_id": marker["run"],
         **classify(events),
@@ -361,7 +360,7 @@ def main():
         "",
     ]
     if marker["version"] < 4:
-        lines.append("Probe v3 lacks request-level round IDs. Replay with a v4 probe for A/B/C.")
+        lines.append("Probe v3 lacks request-level round IDs. Replay with a v4 probe for A and B1–B3.")
     for key, label in LABELS.items():
         percent = classes[key] / total if total else 0
         lines.append(f"{key} {label}: {classes[key]} writes ({percent:.1%}), "
@@ -376,7 +375,7 @@ def main():
         ax.pie(
             list(classes.values()),
             labels=[f"{key} {LABELS[key]}\n{classes[key]} writes" for key in LABELS],
-            colors=["#6aa9e0", "#8fd18f", "#e0b050", "#b9b9b9"],
+            colors=["#6aa9e0", "#8fd18f", "#a76bba", "#d47f74", "#e0b050", "#b9b9b9"],
             startangle=90,
             autopct="%1.1f%%",
             pctdistance=0.72,
@@ -385,7 +384,7 @@ def main():
     else:
         ax.text(0.5, 0.5, "No confirmed writes in this run", ha="center", va="center")
         ax.axis("off")
-    ax.set_title(f"Bidaw L2 write fates ({total} confirmed writes)")
+    ax.set_title(f"L2 write fates ({total} confirmed writes)")
     fig.savefig(args.out.parent / f"{args.out.name}_pie.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 

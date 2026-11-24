@@ -1,6 +1,6 @@
 import unittest
 
-from bidaw.l2_fate_report import classify
+from bidaw.l2_fate_report import LABELS, classify
 
 
 class ChunkFateTests(unittest.TestCase):
@@ -41,26 +41,46 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(report["padded_tail_writes"], 1)
         self.assertEqual(sum(report["bytes"].values()), 2 * 7340032)
 
-    def test_all_later_lookups_must_hit_l1_and_never_attempt_ssd(self):
+    def test_all_later_lookups_hit_dram_after_ssd_eviction_without_session_end(self):
+        self.start(0)
+        self.write()
+        self.finish(0)
+        self.event("ssd_eviction", bytes=7)
+        self.start(1)
+        self.event("lookup", request="1")
+        self.event("l1_hit", request="1")
+        self.event("load_attempt", request="1", adapter="ssd")
+        self.finish(1)
+        self.assertEqual(self.counts()["A"], 1)
+
+    def test_first_dram_miss_uses_copy_residency_at_lookup_time(self):
+        for removal, expected in (("before", "B2"), ("after", "B3"), ("absent", "B3")):
+            with self.subTest(removal=removal):
+                self.events.clear()
+                self.start(0)
+                self.write()
+                self.finish(0)
+                self.start(1)
+                self.event("lookup", request="hit")
+                self.event("l1_hit", request="hit")
+                if removal == "before":
+                    self.event("ssd_eviction", bytes=7)
+                self.event("lookup", request="first-miss")
+                if removal == "after":
+                    self.event("delete", adapter="ssd", eviction=True)
+                self.event("lookup", request="second-miss")
+                self.finish(1)
+                self.assertEqual(self.counts()["U"], 1)
+                self.event("round_session_end", round=1)
+                self.assertEqual(self.counts()[expected], 1)
+
+    def test_l2_hit_missing_readback_evidence_is_unresolved(self):
         self.start(0)
         self.write()
         self.finish(0)
         self.start(1)
         self.event("lookup", request="1")
-        self.event("l1_hit", request="1")
-        self.finish(1, last=True)
-        self.assertEqual(self.counts(), dict(A=1, B=0, C=0, U=0))
-
-        self.events.pop()
-        self.events.pop()
-        self.event("lookup", request="2")
-        self.finish(1, last=True)
-        self.assertEqual(self.counts()["U"], 1)
-
-        self.events.pop()
-        self.events.pop()
-        self.event("l1_hit", request="2")
-        self.event("load_attempt", request="2", adapter="ssd")
+        self.event("l2_hit", request="1")
         self.finish(1, last=True)
         self.assertEqual(self.counts()["U"], 1)
 
@@ -72,7 +92,13 @@ class ChunkFateTests(unittest.TestCase):
         self.finish(1)
         self.assertEqual(self.counts()["U"], 1)
         self.event("round_session_end", round=1)
-        self.assertEqual(self.counts()["B"], 1)
+        self.assertEqual(self.counts()["B1"], 1)
+
+    def test_store_draining_after_a_completed_session_is_natural_dead_write(self):
+        self.start(0)
+        self.finish(0, last=True)
+        self.write()
+        self.assertEqual(self.counts()["B1"], 1)
 
     def test_shared_write_checks_other_sessions_and_waits_for_replay_end(self):
         def event(kind, salt, **fields):
@@ -89,14 +115,14 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(self.counts()["U"], 1)
 
         event("shared_replay_end", "")
-        self.assertEqual(self.counts()["B"], 1)
+        self.assertEqual(self.counts()["B1"], 1)
         self.events.pop()
         marker("start", "reader", 0)
         event("lookup", "", request="reuse", round_id="reader")
         marker("finish", "reader", 0)
         marker("session_end", "reader", 0)
         event("shared_replay_end", "")
-        self.assertEqual(self.counts()["U"], 1)
+        self.assertEqual(self.counts()["B3"], 1)
 
         event("l1_hit", "", request="reuse")
         self.assertEqual(self.counts()["A"], 1)
@@ -109,7 +135,6 @@ class ChunkFateTests(unittest.TestCase):
         self.start(1)
         before_access = len(self.events)
         for kind, fields in (
-            ("lookup", {"request": "later"}),
             ("lookup", {"request": "unscoped", "round_id": "missing"}),
             ("load_attempt", {"adapter": "ssd", "io_task": "later"}),
         ):
@@ -135,81 +160,49 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(report["unattributed_load_events"], 0)
         self.assertEqual(report["legacy_touch_events"], 1)
 
+        del self.events[-2:]
         self.event("load_attempt", adapter="ssd", io_task="1")
         self.event("load", adapter="ssd", io_task="1")
+        self.finish(1, last=True)
         report = classify(self.events)
         self.assertEqual(report["classes"]["U"], 1)
         self.assertEqual(report["load_events"], 1)
         self.assertEqual(report["attributed_load_events"], 1)
 
-    def readback(self, *, lookup_round_id=None, removed_again=False, padded=False):
+    def readback(self, *, padded=False):
         self.start(0)
         if padded:
             self.event("write", adapter="ssd", bytes=7340032, tail_valid_tokens=88)
         else:
             self.write()
         self.finish(0)
-        self.event("l1_evict", policy="bidaw_eviction_policy")
-        if removed_again:
-            self.event("l1_remove")
         self.start(1)
-        self.event("lookup", request="1", round_id=lookup_round_id or self.round_id)
-        self.event("preparing", request="1")
-        self.event("load_attempt", request="1", adapter="ssd")
-        self.event("load", request="1", adapter="ssd")
+        self.event("lookup", request="1")
+        self.event("load_attempt", request="1", adapter="ssd", io_task="read")
+        self.event("load", request="1", adapter="ssd", io_task="read")
 
-    def test_effective_write_requires_linked_preparing_dispatch_and_l2_hit(self):
+    def test_c_precedes_a_and_an_incomplete_window(self):
         self.readback()
-        self.assertEqual(self.counts()["U"], 1)
-        self.event("l2_hit", request="other")
-        self.assertEqual(self.counts()["U"], 1)
+        self.event("l1_hit", request="1")
         self.event("l2_hit", request="1")
-        self.assertEqual(self.counts()["U"], 1)
-        self.finish(1)
         self.assertEqual(self.counts()["C"], 1)
-        self.assertEqual(classify(self.events)["qualifying_prefetch_write_pairs"], 1)
 
-        self.event("delete", adapter="ssd", eviction=False)
-        self.write(size=11)
-        result = classify(self.events)
-        self.assertEqual(result["classes"], dict(A=0, B=0, C=1, U=1))
-        self.assertEqual(result["bytes"]["U"], 11)
-        self.assertEqual(result["rewrite_events"], 1)
-        self.events[3]["policy"] = "LRU"
-        self.assertEqual(self.counts()["U"], 2)
-
-    def test_c_requires_eviction_before_lookup_and_accepts_eviction_during_round(self):
+    def test_ssd_hit_is_attributed_only_to_the_rewritten_copy(self):
         self.start(0)
         self.write()
         self.finish(0)
+        self.event("delete", adapter="ssd", eviction=True)
         self.start(1)
-        self.event("l1_evict", policy="bidaw_eviction_policy")
-        eviction = self.events[-1]
+        self.write(size=11)
         self.event("lookup", request="1")
-        lookup = self.events[-1]
-        self.event("preparing", request="1")
         self.event("load_attempt", request="1", adapter="ssd")
         self.event("load", request="1", adapter="ssd")
         self.event("l2_hit", request="1")
-        self.finish(1)
-        self.assertEqual(self.counts()["C"], 1)
-
-        eviction["t_ns"], lookup["t_ns"] = lookup["t_ns"], eviction["t_ns"]
-        self.assertEqual(self.counts()["U"], 1)
-
-    def test_same_salt_readback_without_matching_round_is_not_c(self):
-        self.readback(lookup_round_id="another-request")
-        self.event("l2_hit", request="1")
-        self.finish(1)
-        report = classify(self.events)
-        self.assertEqual(report["writes_read_back"], 1)
-        self.assertEqual(report["classes"], dict(A=0, B=0, C=0, U=1))
-
-    def test_later_non_policy_removal_invalidates_old_bidaw_eviction(self):
-        self.readback(removed_again=True)
-        self.event("l2_hit", request="1")
-        self.finish(1)
-        self.assertEqual(self.counts(), dict(A=0, B=0, C=0, U=1))
+        self.finish(1, last=True)
+        result = classify(self.events)
+        self.assertEqual(result["classes"], {**dict.fromkeys(LABELS, 0), "B2": 1, "C": 1})
+        self.assertEqual(result["bytes"]["C"], 11)
+        self.assertEqual(result["rewrite_events"], 1)
 
     def test_confirmed_readback_c_matches_io_and_hit_without_policy_events(self):
         self.write()
@@ -217,14 +210,13 @@ class ChunkFateTests(unittest.TestCase):
         self.event("load_attempt", request="r", adapter="ssd", io_task="read")
         self.event("load", request="r", adapter="ssd", io_task="read")
         self.event("l2_hit", request="other")
-        self.assertEqual(classify(self.events, confirmed_readback=True)["classes"]["U"], 1)
+        self.assertEqual(classify(self.events)["classes"]["U"], 1)
 
         self.event("l2_hit", request="r")
-        result = classify(self.events, confirmed_readback=True)
-        self.assertEqual(result["classes"], dict(A=0, B=0, C=1, U=0))
+        result = classify(self.events)
+        self.assertEqual(result["classes"], {**dict.fromkeys(LABELS, 0), "C": 1})
         self.assertEqual(result["bytes"]["C"], 7)
         self.assertEqual(result["qualifying_prefetch_write_pairs"], 1)
-        self.assertEqual(self.counts()["U"], 1)
 
     def test_confirmed_readback_does_not_assign_a_hit_to_ambiguous_copies(self):
         for adapter in ("ssd-1", "ssd-2"):
@@ -232,26 +224,25 @@ class ChunkFateTests(unittest.TestCase):
             self.event("load_attempt", request="r", adapter=adapter, io_task=adapter)
             self.event("load", request="r", adapter=adapter, io_task=adapter)
         self.event("l2_hit", request="r")
-        result = classify(self.events, confirmed_readback=True)
+        result = classify(self.events)
         self.assertEqual(result["writes_read_back"], 2)
-        self.assertEqual(result["classes"], dict(A=0, B=0, C=0, U=2))
+        self.assertEqual(result["classes"], {**dict.fromkeys(LABELS, 0), "U": 2})
 
-    def test_padded_write_is_not_c_in_normal_replay(self):
+    def test_confirmed_padded_write_counts_as_c(self):
         self.readback(padded=True)
         self.event("l2_hit", request="1")
         self.finish(1)
-        self.assertEqual(self.counts(), dict(A=0, B=0, C=0, U=1))
+        self.assertEqual(self.counts()["C"], 1)
 
-    def test_legacy_log_cannot_claim_a_b_or_c_from_timestamps_alone(self):
+    def test_legacy_log_cannot_infer_b_or_a_from_timestamps_alone(self):
         self.readback()
-        self.event("l2_hit", request="1")
         self.finish(1, last=True)
         for event in self.events:
             event.pop("round_id")
         report = classify(self.events)
         self.assertEqual(report["writes_read_back"], 1)
         self.assertEqual(report["writes_without_round_evidence"], 1)
-        self.assertEqual(report["classes"], dict(A=0, B=0, C=0, U=1))
+        self.assertEqual(report["classes"]["U"], 1)
 
     def test_load_frequency_counts_only_matched_write_lifecycles(self):
         self.start(0)
@@ -264,7 +255,7 @@ class ChunkFateTests(unittest.TestCase):
         self.finish(0, last=True)
 
         report = classify(self.events)
-        self.assertEqual(report["classes"], dict(A=0, B=0, C=0, U=1))
+        self.assertEqual(report["classes"], {**dict.fromkeys(LABELS, 0), "U": 1})
         self.assertEqual(report["load_events"], 3)
         self.assertEqual(report["attributed_load_events"], 2)
         self.assertEqual(report["unattributed_load_events"], 1)
@@ -286,4 +277,4 @@ class ChunkFateTests(unittest.TestCase):
         self.assertEqual(report["unattributed_load_events"], 1)
         self.assertEqual(report["writes_read_back"], 0)
         self.event("l2_hit", request="r")
-        self.assertEqual(classify(self.events, confirmed_readback=True)["classes"]["C"], 0)
+        self.assertEqual(classify(self.events)["classes"]["C"], 0)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare A/B/C/U write outcomes using the same C rule for every arm."""
+"""Compare SSD write outcomes using the same rules for every arm."""
 import argparse
 import json
 from pathlib import Path
@@ -7,7 +7,7 @@ from pathlib import Path
 from bidaw.gandalf_report import ARMS
 from bidaw.l2_fate_report import LABELS, classify, latest_run
 
-DEFINITIONS = {**LABELS, "C": "Confirmed SSD readback followed by a matching L2 hit"}
+DEFINITIONS = LABELS
 ARM_LABELS = {
     "lru": ("LRU baseline", "FCFS · write-through"),
     "lru_writeback": ("LRU write-back", "FCFS · write on L1 eviction"),
@@ -16,7 +16,9 @@ ARM_LABELS = {
 }
 SERIES = {
     "A": ("#477eb2", "All later lookups hit DRAM"),
-    "B": ("#4c8c71", "No later reuse request"),
+    "B1": ("#4c8c71", "No later reuse"),
+    "B2": ("#8556a0", "SSD eviction before DRAM miss"),
+    "B3": ("#aa5656", "Present at miss, no effective readback"),
     "C": ("#d48b2b", "SSD readback + L2 hit"),
     "U": ("#8994a3", "Unresolved"),
 }
@@ -24,7 +26,7 @@ SERIES = {
 
 def summarize(path):
     marker, events = latest_run(path)
-    counts = classify(events, confirmed_readback=True)
+    counts = classify(events)
     total_bytes = sum(counts["bytes"].values())
     return {
         "log": str(path), "run_id": marker["run"], "probe_version": marker["version"],
@@ -62,12 +64,13 @@ def load_suite(root):
 
 def render(results):
     lines = ["SSD write fates", "", *[f"{key}  {label}" for key, label in DEFINITIONS.items()]]
+    headers = " | ".join(DEFINITIONS)
+    alignment = " | ".join(["---"] + ["---:"] * (len(DEFINITIONS) + 1))
     for key, share_key, total_key, heading in (
         ("classes", "write_share", "physical_writes", "Writes"),
         ("bytes", "byte_share", "physical_write_bytes", "Write bytes")
     ):
-        lines.extend(["", f"| Run | {heading} | A | B | C | U |",
-                      "| --- | ---: | ---: | ---: | ---: | ---: |"])
+        lines.extend(["", f"| Run | {heading} | {headers} |", f"| {alignment} |"])
         for name, stats in results.items():
             values = []
             for category in DEFINITIONS:
@@ -97,12 +100,12 @@ def plot_suite(results, output):
         except OSError:
             return ImageFont.load_default(size=size)
 
-    chart = Image.new("RGB", (1500, 630), "#ffffff")
+    chart = Image.new("RGB", (1500, 668), "#ffffff")
     draw = ImageDraw.Draw(chart)
     title, heading, body, small = font(36, True), font(21, True), font(18), font(16)
     ink, muted = "#172635", "#495968"
     x0, x1 = 386, 964
-    columns = (1018, 1110, 1202, 1294, 1413)
+    columns = (*range(1004, 1400, 67), 1442)
 
     draw.text((42, 32), "SSD write outcomes", font=title, fill=ink)
     repeats = len(results) // len(ARMS)
@@ -127,7 +130,7 @@ def plot_suite(results, output):
         total = sum(counts.values())
         cumulative = 0
         left = x0
-        for x, (category, (color, _)) in zip(columns[:4], SERIES.items(), strict=True):
+        for x, (category, (color, _)) in zip(columns[:-1], SERIES.items(), strict=True):
             count = counts[category]
             cumulative += count
             if total:
@@ -142,9 +145,11 @@ def plot_suite(results, output):
             draw.text(((x0 + x1) // 2, y + 16), "No SSD writes", font=small, fill=muted, anchor="mm")
 
     draw.line((44, 559, 1450, 559), fill="#e0e5ea")
-    for x, (category, (color, label)) in zip((44, 416, 784, 1152), SERIES.items(), strict=True):
-        draw.rounded_rectangle((x, 585, x + 21, 606), radius=3, fill=color)
-        draw.text((x + 30, 582), f"{category}  {label}", font=body, fill=ink)
+    for index, (category, (color, label)) in enumerate(SERIES.items()):
+        x = 44 + (index % 3) * 480
+        y = 582 + (index // 3) * 42
+        draw.rounded_rectangle((x, y + 3, x + 21, y + 24), radius=3, fill=color)
+        draw.text((x + 30, y), f"{category}  {label}", font=body, fill=ink)
     chart.save(output)
 
 
@@ -166,7 +171,7 @@ def main():
     except (OSError, ValueError, KeyError) as exc:
         parser.exit(2, f"{parser.prog}: {exc}\n")
     output.parent.mkdir(parents=True, exist_ok=True)
-    summary = {"report_version": 1, "definitions": DEFINITIONS, "runs": results}
+    summary = {"report_version": 2, "definitions": DEFINITIONS, "runs": results}
     Path(f"{output}.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     report = render(results)
     Path(f"{output}.txt").write_text(report, encoding="utf-8")
