@@ -2,7 +2,7 @@
 """Opt-in, bounded local-FS tiering for the pinned LMCache MP server."""
 import asyncio
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum, auto
 from functools import wraps
 import logging
@@ -12,7 +12,7 @@ from pathlib import Path
 from threading import Lock
 import time
 
-from bidaw.gandalf_policy import Decision, History, choose
+from bidaw.gandalf_policy import Block, Decision, History, choose
 from bidaw.l2_event_probe import record_tier_event
 
 LOGGER = logging.getLogger(__name__)
@@ -142,9 +142,11 @@ class BoundedFS:
         finally:
             temporary.unlink(missing_ok=True)
 
-    async def admit(self, key, data, victims=None):
+    async def admit(self, key, data, victims=None, *, can_move=None):
         """Persist one object and return the outcome and newly written bytes."""
         async with self.io_lock:
+            if can_move is not None and not can_move():
+                return Admission.BLOCKED, 0
             disk, pinned = self.snapshot()
             if key in disk:
                 if disk[key] == len(data) and await self.adapter._key_exists_on_disk(key):
@@ -199,12 +201,14 @@ class BoundedFS:
             return Admission.STORED, len(data)
 
 
-def reclaim(manager, budget, decision, success_code):
+def reclaim(manager, budget, decision, success_code, *, linear_state=None,
+            selection_ms=None, can_move=None):
     key = decision.key
     record_tier_event("tier_decision", key, action=decision.action,
                       drop_cost=decision.drop_cost, write_cost=decision.write_cost,
                       replacement_cost=decision.replacement_cost, victims=len(decision.victims),
-                      drop_score=decision.drop_score, move_score=decision.move_score)
+                      drop_score=decision.drop_score, move_score=decision.move_score,
+                      linear_state=linear_state, selection_ms=selection_ms)
     if decision.action != "drop":
         reservation = manager.reserve_read([key]).get(key)
         if reservation is None or reservation[0] != success_code or reservation[1] is None:
@@ -212,7 +216,7 @@ def reclaim(manager, budget, decision, success_code):
         try:
             data = bytes(reservation[1].byte_array)
             victims = decision.victims if budget.settings.mode == "gandalf" else None
-            operation = budget.admit(key, data, victims)
+            operation = budget.admit(key, data, victims, can_move=can_move)
             try:
                 future = asyncio.run_coroutine_threadsafe(operation, budget.adapter._loop)
             except RuntimeError:
@@ -262,6 +266,7 @@ def apply_tiering():
         raise ValueError("The first-stage benchmark requires BIDAW_PAD_TAIL=0")
 
     from lmcache.v1.distributed.error import L1Error
+    from lmcache.v1.distributed.internal_api import L1ManagerListener
     from lmcache.v1.distributed.l1_manager.dram import DramL1Manager
     from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
         FSL2Adapter, FSL2AdapterConfig, L2StoreResult,
@@ -278,6 +283,21 @@ def apply_tiering():
 
     register_store_policy("gandalf_deferred", DeferredStorePolicy)
     history = History(settings.horizon)
+
+    class LinearCommitListener(L1ManagerListener):
+        def on_l1_keys_write_finished(self, keys):
+            history.commit_linear(keys)
+
+        def _ignore(self, keys):
+            pass
+
+        on_l1_keys_reserved_read = _ignore
+        on_l1_keys_read_finished = _ignore
+        on_l1_keys_reserved_write = _ignore
+        on_l1_keys_finish_write_and_reserve_read = _ignore
+        on_l1_keys_deleted_by_manager = _ignore
+        on_l1_keys_accessed = _ignore
+
     fs_init = FSL2Adapter.__init__
     fs_delete = FSL2Adapter._execute_delete
     fs_load = FSL2Adapter._execute_load
@@ -307,6 +327,8 @@ def apply_tiering():
             raise ValueError("Tier comparison requires one DRAM manager and one FS adapter")
         self._gandalf_budget = adapter._gandalf_budget
         self._eviction_controllers[0]._gandalf_budget = self._gandalf_budget
+        if settings.mode == "gandalf":
+            self._eviction_controllers[0]._l1_manager.register_listener(LinearCommitListener())
         _STORAGE = self
 
     async def execute_store(self, keys, objects, task_id):
@@ -368,12 +390,21 @@ def apply_tiering():
                 disk, pinned = budget.snapshot()
                 if not eligible:
                     break
+                started = time.perf_counter()
                 decision = choose(dram, eligible, disk, pinned, settings.capacity, history,
                                   settings.recompute_price, budget.write_price, settings.alpha)
+                selection_ms = (time.perf_counter() - started) * 1000
                 if decision is None:
                     break
                 attempted.add(decision.key)
-                reclaim(manager, budget, decision, L1Error.SUCCESS)
+                state = history.linear_state(decision.key)
+                if decision.action == "move" and state == "superseded":
+                    decision = Decision(decision.key, "drop", drop_score=0.0)
+                can_move = None
+                if state == "live" and decision.action == "move":
+                    can_move = lambda key=decision.key: history.linear_state(key) == "live"
+                reclaim(manager, budget, decision, L1Error.SUCCESS, linear_state=state,
+                        selection_ms=selection_ms, can_move=can_move)
         except Exception:
             LOGGER.exception("Tier eviction cycle failed")
             budget.increment("eviction_failures")
@@ -391,6 +422,12 @@ def apply_tiering():
         _observe_prefixes(history)
 
 
+def _group_kinds(attention):
+    kinds = attention.group_kinds or ("attention",) * len(attention.num_chunks_in_sw)
+    return {group: "full" if kind == "attention" and window < 0 else "linear"
+            for group, (kind, window) in enumerate(zip(kinds, attention.num_chunks_in_sw, strict=True))}
+
+
 def _observe_prefixes(history):
     from lmcache.v1.distributed.api import ipc_key_to_object_keys
     from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
@@ -401,28 +438,45 @@ def _observe_prefixes(history):
 
     @wraps(resolve)
     def resolve_keys(self, key, object_group_ids):
-        if key.world_size != 1 or list(object_group_ids) != [0] or not key.cache_salt:
-            raise ValueError("Gandalf requires one full-attention KV group, one rank and salted sessions")
-        if key.start:
-            # STORE may only include a suffix in its range; reconstruct its ancestors.
-            hashes = self.token_hasher.compute_packed_chunk_hashes(key.token_bytes, end=key.end)
-            history.bind(ipc_key_to_object_keys(key, hashes, [0])[0])
-            return resolve(self, key, object_group_ids)
+        if key.world_size != 1 or not key.cache_salt:
+            raise ValueError("Gandalf requires one rank and salted sessions")
         result = resolve(self, key, object_group_ids)
-        history.bind(result[0])
+        attention = self.layout_desc_registry.find_attn_desc(key.model_name, key.world_size)
+        round_number = history.observe(key.cache_salt, key.request_id)
+        start = key.start // self.chunk_size
+        kinds = _group_kinds(attention)
+        history.register_layout(key.model_name, kinds)
+        needs_prefix = any(kinds[group] == "full" or attention.num_chunks_in_sw[group] > 1
+                           for group in object_group_ids)
+        prefix_hashes = (self.token_hasher.compute_packed_chunk_hashes(key.token_bytes, end=key.start)
+                         if start and needs_prefix else [])
+        for group, keys in zip(object_group_ids, result, strict=True):
+            window = attention.num_chunks_in_sw[group]
+            if kinds[group] == "full":
+                prefix = ipc_key_to_object_keys(key, prefix_hashes, [group])[0] if start else []
+                history.bind(prefix + keys, round_number=round_number, group=group)
+            else:
+                if window > 1:
+                    hashes = prefix_hashes + [obj_key.identity.chunk_hash for obj_key in keys]
+                for boundary, obj_key in enumerate(keys, start=start + 1):
+                    window_hashes = tuple(hashes[max(0, boundary - window):boundary]) if window > 1 else ()
+                    # Native STORE completion round-trips untyped attributes
+                    # through MessagePack before invoking the L1 listener.
+                    obj_key.extra_attributes["gandalf_block"] = asdict(Block(
+                        "linear", key.cache_salt, round_number, group, boundary,
+                        max(1, window), window_hashes,
+                    ))
         return result
 
     @wraps(lookup)
     def observe(self, key, tp_size):
         if key.world_size != 1 or not key.cache_salt:
             raise ValueError("Gandalf requires one rank and salted replay sessions")
+        history.observe(key.cache_salt, key.request_id)
         registry = self._ctx.layout_desc_registry
         if registry.find(key.model_name, key.world_size) is not None:
             attention = registry.find_attn_desc(key.model_name, key.world_size)
-            if (tuple(attention.num_chunks_in_sw) != (-1,)
-                    or attention.group_kinds not in ((), ("attention",))):
-                raise ValueError("Gandalf requires one full-attention KV group")
-        history.observe(key.cache_salt, key.request_id)
+            history.register_layout(key.model_name, _group_kinds(attention))
         self._ctx.storage_manager._gandalf_budget.begin()
         return lookup(self, key, tp_size)
 

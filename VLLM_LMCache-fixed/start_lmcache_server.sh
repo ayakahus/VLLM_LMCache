@@ -33,14 +33,20 @@ mkdir -p "${DEMO_DIR}/logs" "$LMCACHE_L2_PATH"
 l2_adapter=$(python3 -c 'import json,sys; print(json.dumps(dict(type="fs", base_path=sys.argv[1])))' "$LMCACHE_L2_PATH")
 
 export LMCACHE_LOG_LEVEL="${LMCACHE_LOG_LEVEL:-INFO}"
-printf '[lmcache] chunk=256 tokens, padded_tail=%s, bidaw_capacity=%s keys, L2=%s\n' \
-    "$BIDAW_PAD_TAIL" "$BIDAW_L1_CAPACITY_KEYS" "$LMCACHE_L2_PATH"
+CHUNK_SIZE=256
+GROUP_ARGS=()
+if [[ "${GANDALF_HYBRID:-0}" == 1 ]]; then
+    CHUNK_SIZE=${HYBRID_CHUNK_SIZE:-544}
+    GROUP_ARGS+=(--separate-object-groups)
+fi
+printf '[lmcache] chunk=%s tokens, padded_tail=%s, bidaw_capacity=%s keys, L2=%s\n' \
+    "$CHUNK_SIZE" "$BIDAW_PAD_TAIL" "$BIDAW_L1_CAPACITY_KEYS" "$LMCACHE_L2_PATH"
 
 # All arms use the same patches/watermark. Policy and DQ are independent.
 exec python3 -m bidaw.lmcache_server_entry server \
     --host 0.0.0.0 --port 5555 \
     --http-host 0.0.0.0 --http-port 8080 \
-    --chunk-size 256 \
+    --chunk-size "$CHUNK_SIZE" "${GROUP_ARGS[@]}" \
     --l1-size-gb "$L1_GB" \
     --eviction-policy "$EVICTION_POLICY" \
     --l2-prefetch-policy retain \

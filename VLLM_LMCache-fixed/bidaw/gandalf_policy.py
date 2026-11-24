@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Online full-attention placement using the normalized costs in Gandalf §3.3."""
+"""Online hybrid-cache placement using the normalized costs in Gandalf §3.3."""
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, replace
-from threading import Lock
+from heapq import heappop, heappush
+from threading import RLock
 
 
 @dataclass(frozen=True)
@@ -17,34 +18,123 @@ class Decision:
     move_score: float | None = None
 
 
+@dataclass(frozen=True)
+class Block:
+    kind: str
+    session: str
+    round: int
+    group: int
+    boundary: int
+    window: int
+    window_hashes: tuple | list = ()
+
+
 class History:
     def __init__(self, horizon):
         self.horizon = horizon
-        self.lock = Lock()
+        self.lock = RLock()
         self.clock = 0
         self.last = {}
         self.seen = OrderedDict()
         self.gaps = deque(maxlen=8192)
         self.parents = {}
+        self.full_keys = {}
+        self.blocks = {}
+        self.rounds = Counter()
+        # A session can have several independent linear groups. A sliding
+        # window retains its last window of chunks as one live checkpoint.
+        self.latest_linear = defaultdict(dict)
+        self.layouts = {}
 
     def observe(self, session, request_id):
         with self.lock:
-            if request_id in self.seen:
-                return
-            self.seen[request_id] = None
+            request = (session, request_id)
+            if request in self.seen:
+                return self.seen[request]
+            self.rounds[session] += 1
+            self.seen[request] = self.rounds[session]
             if len(self.seen) > 8192:
                 self.seen.popitem(last=False)
             self.clock += 1
             if session in self.last:
                 self.gaps.append(self.clock - self.last[session])
             self.last[session] = self.clock
+            return self.rounds[session]
 
-    def bind(self, prefix):
+    def register_layout(self, model, kinds):
+        with self.lock:
+            self.layouts[model] = kinds
+
+    def bind(self, prefix, *, round_number=0, group=0):
         with self.lock:
             parent = None
-            for key in prefix:
-                self.parents.setdefault(key, parent)
+            for boundary, key in enumerate(prefix, start=1):
+                self.blocks.setdefault(key, Block("full", key.cache_salt, round_number,
+                                                  group, boundary, 0))
+                if key not in self.parents:
+                    self.parents[key] = parent
+                    identity = getattr(key, "identity", None)
+                    if identity is not None:
+                        scope = (identity.model_name, identity.kv_rank, key.cache_salt)
+                        self.full_keys[scope, identity.chunk_hash, group] = key
                 parent = key
+
+    def commit_linear(self, keys):
+        written = [(key, key.extra_attributes.get("gandalf_block")) for key in keys]
+        written = [(key, Block(**block)) for key, block in written if isinstance(block, dict)]
+        if not written:
+            return
+        # Process the furthest confirmed boundary first within each write completion.
+        written.sort(key=lambda pair: (pair[1].round, pair[1].boundary), reverse=True)
+        with self.lock:
+            for key, block in written:
+                self.blocks.setdefault(key, block)
+                latest = self.latest_linear[block.session]
+                group = (key.identity.model_name, key.identity.kv_rank, block.group)
+                head, active = latest.get(group, (None, set()))
+                if (head is not None and block.round < head.round
+                        and key.identity.chunk_hash not in head.window_hashes):
+                    continue
+                if head is None or (block.round, block.boundary) > (head.round, head.boundary):
+                    if head is not None and block.round > head.round:
+                        # Carry overlap only when it is on the new round's prefix.
+                        active = {k for k in active if k.identity.chunk_hash in block.window_hashes}
+                    head = block
+                active = {k for k in active if self.blocks[k].boundary > head.boundary - head.window}
+                if (block.boundary > head.boundary - head.window
+                        and (not head.window_hashes or key.identity.chunk_hash in head.window_hashes)):
+                    active.add(key)
+                latest[group] = (head, active)
+
+    def linear_state(self, key):
+        with self.lock:
+            block = self.blocks.get(key)
+            if block is None or block.kind != "linear":
+                return None
+            group = (key.identity.model_name, key.identity.kv_rank, block.group)
+            _, active = self.latest_linear[block.session][group]
+            return "live" if key in active else "superseded"
+
+    def placement_snapshot(self, keys):
+        with self.lock:
+            blocks = {key: self.blocks[key] for key in keys if key in self.blocks}
+            states = {key: self.linear_state(key) for key, block in blocks.items()
+                      if block.kind == "linear"}
+            boundaries = {}
+            for key, state in states.items():
+                if state == "live":
+                    block = blocks[key]
+                    group = (key.identity.model_name, key.identity.kv_rank, block.group)
+                    boundaries[key] = self.latest_linear[block.session][group][0].boundary
+            return blocks, states, boundaries, self.layouts.copy()
+
+    def full_prefix_hashes(self, scope, chunk_hash, group):
+        with self.lock:
+            head = self.full_keys.get((scope, chunk_hash, group))
+            hashes = []
+            while head is not None and (head := self.parents.get(head)) is not None:
+                hashes.append(head.identity.chunk_hash)
+        return reversed(hashes)
 
     def snapshot(self, keys):
         with self.lock:
@@ -62,78 +152,151 @@ class History:
         return parents, {session: (age, estimates[age]) for session, age in ages.items()}
 
 
+def plan_victims(disk, protected, dram, dram_children, ssd_children,
+                 parents, costs, order, needed):
+    remaining = disk.keys() - protected
+    child_count = {key: len(ssd_children[key]) for key in remaining}
+    leaves = []
+
+    def queue_leaf(key):
+        if not child_count[key] and (key in dram or not dram_children[key]):
+            heappush(leaves, (costs[key][1], order[key], key))
+
+    for key in remaining:
+        queue_leaf(key)
+    victims = []
+    while leaves:
+        _, _, victim = heappop(leaves)
+        victims.append(victim)
+        needed -= disk[victim]
+        if needed <= 0:
+            return (tuple(victims), sum(costs[key][0] for key in victims),
+                    min(costs[key][1] for key in victims))
+        parent = parents.get(victim)
+        if parent in remaining:
+            child_count[parent] -= 1
+            queue_leaf(parent)
+    return None
+
+
 def choose(dram, eligible, disk, pinned, capacity, history, recompute_price,
            write_price, alpha):
     """Return one eviction decision. SSD victims are planned before any deletion."""
     resident = dram.keys() | disk.keys()
-    parents, activity = history.snapshot(resident)
+    with history.lock:
+        parents, activity = history.snapshot(resident)
+        blocks, states, boundaries, layouts = history.placement_snapshot(resident)
+    candidates = [key for key in dram if key in eligible]
+    expired = next((key for key in candidates if states.get(key) == "superseded"), None)
+    if expired is not None:
+        return Decision(expired, "drop", drop_score=0.0)
+
     children = defaultdict(set)
     for key, parent in parents.items():
         children[parent].add(key)
 
-    def leaf_cost(key, size):
-        age, reuse = activity.get(key.cache_salt, (1, 0.5))
-        cost = reuse * recompute_price
-        return cost, cost / (size * age)
-
-    def plan_victims(key, needed):
-        if needed <= 0:
-            return (), 0.0, 0.0
-        protected = {key, *ancestors(key)}
-        remaining = disk.keys() - pinned - protected
-        victims = []
-        removed = set()
-        while remaining:
-            leaves = [item for item in remaining
-                      if ssd_children[item] <= removed and (item in dram or not dram_children[item])]
-            if not leaves:
-                break
-            victim = min(leaves, key=lambda item: (ssd_costs[item][1], order[item]))
-            remaining.remove(victim)
-            removed.add(victim)
-            victims.append(victim)
-            needed -= disk[victim]
-            if needed <= 0:
-                # Eq. (8) prices the cheapest victim. Reclaim still reserves
-                # enough space for the entire object and removes all planned leaves.
-                return (tuple(victims), sum(ssd_costs[item][0] for item in victims),
-                        min(ssd_costs[item][1] for item in victims))
-        return None
+    dram_children = {key: children[key] & dram.keys() for key in resident}
+    ssd_children = {key: children[key] & disk.keys() for key in resident}
 
     def ancestors(key):
         while parents.get(key) is not None:
             key = parents[key]
             yield key
 
-    candidates = [key for key in dram if key in eligible]
-    dram_children = {key: children[key] & dram.keys() for key in resident}
-    ssd_children = {key: children[key] & disk.keys() for key in resident}
-    drops = [key for key in candidates
-             if not dram_children[key] and (key in disk or not ssd_children[key])]
+    # A rollback boundary needs every group at the same prefix hash. Index
+    # resident objects once so looking for it does not scan the entire cache.
+    groups = defaultdict(dict)
+    checkpoints = defaultdict(dict)
+    for key, block in (blocks.items() if states else ()):
+        identity = getattr(key, "identity", None)
+        if identity is None:
+            continue
+        scope = (identity.model_name, identity.kv_rank, block.session)
+        groups[scope][block.group] = block.kind
+        checkpoints[scope, identity.chunk_hash][block.group] = key
+
+    def rollback_chunks(key):
+        block = blocks[key]
+        identity = getattr(key, "identity", None)
+        if identity is None:
+            return block.boundary
+        scope = (identity.model_name, identity.kv_rank, block.session)
+        layout = layouts.get(identity.model_name, groups[scope])
+        full_groups = [group for group, kind in layout.items() if kind == "full"]
+        linear_groups = [group for group, kind in layout.items() if kind == "linear"]
+        boundary = boundaries[key]
+        if not full_groups:
+            return boundary
+        prefix = history.full_prefix_hashes(scope, identity.chunk_hash, full_groups[0])
+        fallback = 0
+        linear_runs = Counter()
+        for n, chunk_hash in enumerate(prefix, start=1):
+            row = checkpoints.get((scope, chunk_hash), {})
+            if any(group not in row for group in full_groups):
+                break
+            for group in linear_groups:
+                linear_runs[group] = linear_runs[group] + 1 if group in row else 0
+            if all(group in row and linear_runs[group] >= min(n, blocks[row[group]].window)
+                   for group in linear_groups):
+                fallback = n
+        return max(1, boundary - fallback)
+
+    def leaf_cost(key, size):
+        age, reuse = activity.get(key.cache_salt, (1, 0.5))
+        state = states.get(key)
+        if state == "superseded":
+            return 0.0, 0.0
+        chunks = rollback_chunks(key) if state else 1
+        cost = reuse * recompute_price * chunks
+        return cost, cost / (size * age)
+
+    disk_prefix = {}
+
+    def has_disk_ancestors(key):
+        unseen = []
+        parent = parents.get(key)
+        while parent is not None and parent in disk and parent not in disk_prefix:
+            unseen.append(parent)
+            parent = parents.get(parent)
+        complete = parent is None or disk_prefix.get(parent, False)
+        disk_prefix.update(dict.fromkeys(unseen, complete))
+        return complete
 
     best_drop = None
-    if drops:
-        key = min(drops, key=lambda item: leaf_cost(item, dram[item])[1])
-        cost, score = leaf_cost(key, dram[key])
-        action = "release_duplicate" if key in disk else "drop"
-        # A duplicate competes on its DRAM reuse value, then releases for zero writes.
-        best_drop = Decision(key, action, drop_cost=cost, drop_score=score)
-
-    ssd_costs = {key: (0.0, 0.0) if key in dram else leaf_cost(key, size)
-                 for key, size in disk.items()}
-    order = {key: index for index, key in enumerate(disk)}
-    used = sum(disk.values())
-    best_move = None
+    representatives = {}
     for key in candidates:
         size = dram[key]
-        if (key in disk or key not in parents or size > capacity
-                or any(p not in disk for p in ancestors(key))):
+        state = states.get(key)
+        if state or (not dram_children[key] and (key in disk or not ssd_children[key])):
+            cost, score = leaf_cost(key, size)
+            if best_drop is None or score < best_drop.drop_score:
+                action = "release_duplicate" if key in disk else "drop"
+                best_drop = Decision(key, action, drop_cost=cost, drop_score=score)
+        if (key in disk or size > capacity
+                or (not state and (key not in parents or not has_disk_ancestors(key)))):
             continue
-        plan = plan_victims(key, used + size - capacity)
+        kind = "linear" if state else "full"
+        age, _ = activity.get(key.cache_salt, (1, 0.5))
+        if kind not in representatives or age > representatives[kind][1]:
+            representatives[kind] = (key, age)
+
+    used = sum(disk.values())
+    best_move = None
+    # Plan SSD replacement only for the at-most-two representatives.
+    if any(used + dram[key] > capacity for key, _ in representatives.values()):
+        ssd_costs = {key: (0.0, 0.0) if key in dram else leaf_cost(key, size)
+                     for key, size in disk.items()}
+        order = {key: index for index, key in enumerate(disk)}
+    for key, age in representatives.values():
+        size = dram[key]
+        needed = used + size - capacity
+        plan = ((), 0.0, 0.0) if needed <= 0 else plan_victims(
+            disk, pinned | set(ancestors(key)), dram, dram_children, ssd_children,
+            parents, ssd_costs, order, needed,
+        )
         if plan is None:
             continue
         victims, replacement, replacement_score = plan
-        age, _ = activity.get(key.cache_salt, (1, 0.5))
         write_cost = size * write_price(size)
         score = write_cost / (size * age) + replacement_score
         if best_move is None or score < best_move.move_score:

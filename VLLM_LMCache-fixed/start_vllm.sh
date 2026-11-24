@@ -27,6 +27,17 @@ source "${DEMO_DIR}/lmcache_geometry.sh"
 
 MODEL_DIR="${DEMO_DIR}/models/Qwen2.5-1.5B-Instruct"
 PORT="${VLLM_PORT:-8000}"
+MODEL_NAME=qwen2.5-1.5b-instruct
+GPU_MEMORY=0.30
+ENGINE_ARGS=(--block-size 16 --max-model-len 6144 --disable-prefix-caching)
+if [[ "${GANDALF_HYBRID:-0}" == 1 ]]; then
+    MODEL_DIR="${DEMO_DIR}/models/Qwen3.5-0.8B"
+    MODEL_NAME=qwen3.5-0.8b
+    GPU_MEMORY=${HYBRID_GPU_MEMORY_UTILIZATION:-0.4}
+    ENGINE_ARGS=(--language-model-only --max-model-len 4096
+                 --max-num-seqs "${GANDALF_PARALLEL:-64}"
+                 --enable-prefix-caching --mamba-cache-mode align)
+fi
 
 mkdir -p "${DEMO_DIR}/logs"
 
@@ -35,7 +46,9 @@ KV_ARGS=()
 if [[ "${VLLM_WITHOUT_LMCACHE:-0}" != "1" ]]; then
     export PYTHONPATH="${DEMO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
     CONNECTOR_CONFIG='{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true}}'
-    if [[ "$BIDAW_PAD_TAIL" == "1" ]]; then
+    if [[ "${GANDALF_HYBRID:-0}" == 1 ]]; then
+        CONNECTOR_CONFIG='{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://127.0.0.1:5555","lmcache.mp.mp_transfer_mode":"lmcache_driven"}}'
+    elif [[ "$BIDAW_PAD_TAIL" == "1" ]]; then
         # The scheduler checks this LMCache instance supports padded writes.
         CONNECTOR_CONFIG='{"kv_connector":"BidawPaddedTailConnector","kv_connector_module_path":"bidaw.padded_tail_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":"tcp://localhost:5555","lmcache.mp.save_decode_cache":true,"lmcache.mp.mp_transfer_mode":"lmcache_driven"}}'
     fi
@@ -46,12 +59,10 @@ fi
 echo "[start_vllm] serving ${MODEL_DIR} on port ${PORT} (GPU=${CUDA_VISIBLE_DEVICES:-1} lmcache=$([[ ${#KV_ARGS[@]} -gt 0 ]] && echo on || echo OFF))"
 
 exec vllm serve "${MODEL_DIR}" \
-    --served-model-name qwen2.5-1.5b-instruct \
+    --served-model-name "$MODEL_NAME" \
     --host 0.0.0.0 \
     --port "${PORT}" \
     --dtype bfloat16 \
-    --block-size 16 \
-    --max-model-len 6144 \
-    --gpu-memory-utilization 0.30 \
-    --disable-prefix-caching \
+    --gpu-memory-utilization "$GPU_MEMORY" \
+    "${ENGINE_ARGS[@]}" \
     "${KV_ARGS[@]}"

@@ -16,6 +16,15 @@ export BIDAW_PAD_TAIL=0
 export BIDAW_EVICTION_WATERMARK=0.95
 export VLLM_WITHOUT_LMCACHE=0
 unset BIDAW_FORCE_POLICY
+export GANDALF_PARALLEL="$parallel"
+export GANDALF_HYBRID="${GANDALF_HYBRID:-0}"
+model_dir=models/Qwen2.5-1.5B-Instruct
+replay_model_args=()
+if [[ "$GANDALF_HYBRID" == 1 ]]; then
+    model_dir=models/Qwen3.5-0.8B
+    replay_model_args=(--model qwen3.5-0.8b --model-dir "$model_dir"
+                       --max-model-len 4096 --max-prompt-tokens 3800)
+fi
 
 arms=(lru lru_writeback bidaw gandalf)
 if [[ "${1:-}" == "--plan" ]]; then
@@ -31,14 +40,14 @@ if [[ $# != 0 || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 source ./env.sh
-python3 - "$users" "$speed" "$parallel" "$l1_gb" "$l2_bytes" <<'PY'
+python3 - "$users" "$speed" "$parallel" "$l1_gb" "$l2_bytes" "$model_dir" <<'PY'
 import math
 import socket
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import sys
 
-users, speed, parallel, dram, ssd = sys.argv[1:]
+users, speed, parallel, dram, ssd, model = sys.argv[1:]
 if (min(int(users), int(parallel)) <= 0 or min(float(speed), float(dram)) <= 0
         or not all(math.isfinite(float(x)) for x in (speed, dram)) or int(ssd) < 7340032):
     sys.exit("Invalid workload or capacity; L2 must fit at least one full KV chunk.")
@@ -53,8 +62,8 @@ import torch
 
 if torch.cuda.device_count() != 1:
     sys.exit("Select one available GPU using CUDA_VISIBLE_DEVICES.")
-if not (Path("models/Qwen2.5-1.5B-Instruct") / "config.json").is_file():
-    sys.exit("The local Qwen2.5-1.5B-Instruct model is required.")
+if not (Path(model) / "config.json").is_file():
+    sys.exit(f"The local model is required: {model}")
 for port in (5555, 8080, 8000):
     with socket.socket() as probe:
         try:
@@ -172,7 +181,7 @@ run_arm() {
 
     python3 -m bidaw.trace_replay --users "$users" --speed "$speed" --parallel "$parallel" \
         --seed "$seed" --warmup-seconds 0 --answer-history fixed --track-chunk-fates \
-        --label "$arm" --out "$out/replay.json" "${extra[@]}" | tee "$out/replay.log"
+        --label "$arm" --out "$out/replay.json" "${replay_model_args[@]}" "${extra[@]}" | tee "$out/replay.log"
 
     wait_for_writes "$out/status-after.json"
     curl -fsS http://127.0.0.1:8000/metrics >"$out/vllm-metrics-after.txt"
