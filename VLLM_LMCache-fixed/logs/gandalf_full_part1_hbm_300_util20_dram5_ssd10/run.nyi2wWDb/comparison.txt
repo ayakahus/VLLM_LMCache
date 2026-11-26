@@ -1,0 +1,5 @@
+arm                         n    writes    GiB    TTFT p95   E2E p95    GPU prefill
+repeat-1/lru                5950      2458  16.80       189.0     820.5         918588
+repeat-1/lru_writeback      5950      2197  15.02       160.0     810.0         917980
+repeat-1/bidaw              5950      2458  16.80       303.9     867.3         918492
+repeat-1/gandalf            5950      1573  10.75       578.3    1058.0        1016236
