@@ -63,8 +63,9 @@ request_configs: dict, 从 sampling_params 提取, 随 STORE op 透传到 Server
 ```
 
 ### 3.2 disk-HRRN
-`priority = 1 + wait_seconds / kv_size_MB`, 每次重排取最大者发预取; 在途上限
-min(4, L2 并发); 等待时间增长保证大 KV 不饿死。
+lookup 完成后按实际 L2 读盘计划的 KV 字节数和请求等待时长计算 HRRN 优先级。
+Preparing Queue 等待期间只保留计划所需的读锁，取得名额后才预留 L1 写缓冲并读盘。
+在途预取请求上限为 `min(4, BIDAW_L2_READ_CONCURRENCY)`，默认 4。
 
 ### 3.3 文件改动清单
 | 文件 | 类型 | 内容 |
@@ -96,16 +97,19 @@ ready 请求 TTFT 不被 SSD 大 KV 请求拖长(排队时间 CDF 对比 FCFS)�
 - per_salt: {最近 answer_tokens, WRD(加权复用距离)直方图, 访问序}
 - ghost cache: 后台线程对最近 W 条 LOOKUP trace 跑 Belady, 分桶统计最优命中率:
   small 桶(WRD < L1 容量) hit=1.0; extreme 桶 hit=0.0; 中间 m 个 promising 桶插值
-- LB 曲线: 在线统计 answer_tokens 分箱 → WRD 下界(单调增), IQR 去离群(§3.3.1)
+- LB 曲线: 回答长度每 32 tokens 一档，每档至少 8 个样本时取 IQR 去离群后的 WRD 最小值。
+  在档位中心拟合不超过各档最小值的单调下界，档间线性插值，区间外沿用最近端点。
 
 ### 4.3 淘汰决策(论文式 2)
 ```
 候选 key k(属 salt s, 上次访问至今被其他 key 占用 W(s,k) 字节):
-  bucket 概率 = 用户 s 的 WRD 直方图, 用 LB(s) 剪掉下界以下桶后归一化
+  有效下界 = max(当前累计 WRD W(s,k), 上一轮回答长度预测的 LB(s))
+  bucket 概率 = 用户 s 的 WRD 直方图，移除有效下界所在桶之前的桶后归一化
   potential(k) = prob_small×1.0 + Σ prob_promising(i)×hit_promising(i) + prob_extreme×0.0
 淘汰 potential 最低的 expected_ratio 比例; destination=L2_CACHE(inclusive)
 ```
-WRD 记账: on_keys_touched/created 里按同 salt 访问序增量累计, O(1) 摊销。
+WRD 按逻辑请求更新。淘汰时用 Fenwick 树查询会话上次访问之后各身份的最近权重，
+查询不改变访问顺序，时间复杂度为 O(log N)。
 
 ### 4.4 文件改动清单
 | 文件 | 类型 | 内容 |

@@ -48,11 +48,19 @@ def apply_dual_queue_patch():
     if getattr(cls, '_bidaw_access_patch', False):
         return STATS.enabled
     enabled = os.environ.get('BIDAW_DUAL_QUEUE', '1') != '0'
+    disk_limit = 4
+    if enabled:
+        try:
+            l2_concurrency = int(os.environ.get('BIDAW_L2_READ_CONCURRENCY', '4'))
+        except ValueError as exc:
+            raise ValueError('BIDAW_L2_READ_CONCURRENCY must be a positive integer') from exc
+        if l2_concurrency < 1:
+            raise ValueError('BIDAW_L2_READ_CONCURRENCY must be a positive integer')
+        disk_limit = min(disk_limit, l2_concurrency)
     STATS.enabled = enabled
     original_init = cls.__init__
     original_submit = cls.submit_prefetch_request
     original_advance = cls._advance_request
-    original_load = cls._submit_load_tasks
     original_retire = cls._retire_request
     original_cleanup = cls._cleanup_in_flight_requests
 
@@ -61,6 +69,7 @@ def apply_dual_queue_patch():
         self._bidaw_enqueue_monotonic = {}
         self._bidaw_waiting_locks = {}
         self._bidaw_disk_ready = {}
+        self._bidaw_disk_in_flight = set()
         original_init(self, *args, **kwargs)
 
     def submit(self, spec):
@@ -146,11 +155,28 @@ def apply_dual_queue_patch():
                     with self._submission_lock:
                         self._bidaw_enqueue_monotonic.pop(rid, None)
 
-    def stage_disk(self, request, reserved_objs):
-        if not reserved_objs:
-            return original_load(self, request, reserved_objs)
-        size_bytes = sum(obj.get_size() for obj in reserved_objs.values())
-        self._bidaw_disk_ready[request.request_id] = request, reserved_objs, size_bytes
+    def stage_disk(self, request):
+        active_l2_descs = {
+            index: desc for index, desc in self._adapter_descriptors.items()
+            if self._is_l2_eligible(request, index)
+        }
+        # Keep only the native plan's read locks while waiting for a disk slot.
+        # _transition_to_load_phase revalidates the plan before reserving L1.
+        self._plan_load(request, active_l2_descs)
+        row_sizes = [
+            pc.get_size_bytes(group.layout_desc.shapes, group.layout_desc.dtypes)
+            for group in request.key_groups
+        ]
+        size_bytes = sum(
+            row.popcount() * row_size
+            for _, cells in request.key_states.l2_locked_keys.items()
+            for row, row_size in zip(cells, row_sizes, strict=True)
+        )
+        if size_bytes:
+            self._bidaw_disk_ready[request.request_id] = request, size_bytes
+        else:
+            self._finish_request(request)
+            self._retire_request(request)
 
     def advance(self, request, signaled_adapters):
         if request.request_id in self._bidaw_disk_ready:
@@ -162,28 +188,29 @@ def apply_dual_queue_patch():
             return
         self._poll_lookup_results(request, adapters)
         if request.all_lookups_done():
-            self._transition_to_load_phase(request)
-            if request.request_id not in self._bidaw_disk_ready and request.all_loads_done():
-                self._finish_request(request)
-                self._retire_request(request)
+            stage_disk(self, request)
 
     def dispatch_disk(self):
         ready = self._bidaw_disk_ready
-        if not ready:
+        in_flight = self._bidaw_disk_in_flight
+        if not ready or len(in_flight) >= disk_limit:
             return
         now = time.monotonic()
         with self._submission_lock:
             arrival = {rid: self._bidaw_enqueue_monotonic[rid] for rid in ready}
         ordered = sorted(ready, key=lambda rid: (
-            -(now - arrival[rid]) / ready[rid][2], arrival[rid], rid
+            -(now - arrival[rid]) / ready[rid][1], arrival[rid], rid
         ))
         for rid in ordered:
+            if len(in_flight) >= disk_limit:
+                break
             reordered = rid != next(iter(ready))
-            request, reserved_objs, size_bytes = ready.pop(rid)
+            request, size_bytes = ready.pop(rid)
             wait = now - arrival[rid]
+            in_flight.add(rid)
             try:
                 record_preparing_dispatch(self, rid)
-                original_load(self, request, reserved_objs)
+                self._transition_to_load_phase(request)
                 if request.all_loads_done():
                     self._finish_request(request)
                     self._retire_request(request)
@@ -201,6 +228,7 @@ def apply_dual_queue_patch():
     def retire(self, request):
         rid = request.request_id
         self._bidaw_disk_ready.pop(rid, None)
+        self._bidaw_disk_in_flight.discard(rid)
         with self._submission_lock:
             self._bidaw_enqueue_monotonic.pop(rid, None)
         return original_retire(self, request)
@@ -214,6 +242,7 @@ def apply_dual_queue_patch():
                 self._bidaw_waiting_locks.clear()
                 self._bidaw_enqueue_monotonic.clear()
             self._bidaw_disk_ready.clear()
+            self._bidaw_disk_in_flight.clear()
             for request in waiting:
                 self._release_all_locks(request)
 
@@ -221,7 +250,6 @@ def apply_dual_queue_patch():
     cls.submit_prefetch_request = submit
     if enabled:
         cls._start_pending_requests = start_pending
-        cls._submit_load_tasks = stage_disk
         cls._advance_request = advance
         cls._retire_request = retire
         cls._cleanup_in_flight_requests = cleanup

@@ -34,7 +34,7 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual((drop.action, drop.key), ("drop", self.child))
         self.assertEqual(self.decision({self.child: 2}, {self.root: 2}).key, self.child)
 
-    def test_replacement_plan_prices_cheapest_victim_and_preserves_ancestors(self):
+    def test_replacement_plan_prices_all_victims_and_preserves_ancestors(self):
         victim, victim_child = Key("victim", "old"), Key("victim_child", "old")
         new, new_child, extra = Key("new", "incoming"), Key("new_child", "incoming"), Key("extra", "incoming")
         self.history.bind([victim, victim_child])
@@ -44,8 +44,37 @@ class PlacementTests(unittest.TestCase):
         decision = self.decision(dram, disk, eligible={new})
         self.assertEqual(decision.victims, (victim_child, victim))
         self.assertAlmostEqual(decision.replacement_cost, 1)
-        self.assertAlmostEqual(decision.move_score, .26)
+        self.assertAlmostEqual(decision.move_score, .01 + 1 / 3)
         self.assertIsNone(self.decision(dram, disk, eligible={new}, pinned={victim_child}))
+
+    def test_free_victim_does_not_hide_cost_of_second_victim(self):
+        duplicate = Key("duplicate")
+        victim = Key("victim")
+        disk = {duplicate: 1, victim: 1}
+        decision = self.decision({self.root: 2, duplicate: 1}, disk,
+                                 capacity=2, eligible={self.root})
+        self.assertEqual((decision.action, decision.key), ("drop", self.root))
+        self.assertAlmostEqual(decision.move_score, .01 + .5 / 2)
+
+    def test_other_full_candidate_can_win_when_older_candidate_is_blocked_or_costly(self):
+        old = Key("old", "old")
+        new = Key("new", "new")
+        duplicate = Key("duplicate")
+        victim = Key("victim")
+        for key in (old, new, duplicate, victim):
+            self.history.bind([key])
+        dram = {old: 2, new: 1, duplicate: 1}
+        disk = {victim: 2, duplicate: 1}
+        parents, _ = self.history.snapshot(dram.keys() | disk.keys())
+        with patch.object(self.history, "snapshot", return_value=(
+            parents, {"old": (10, .5), "new": (1, .5)},
+        )):
+            for pinned in ((victim,), ()):
+                with self.subTest(pinned=pinned):
+                    decision = self.decision(dram, disk, capacity=3, pinned=pinned,
+                                             eligible={old, new})
+                    self.assertEqual((decision.action, decision.key), ("move", new))
+                    self.assertEqual(decision.victims, (duplicate,))
 
     def test_move_gate_prefers_lower_cost_cold_root(self):
         cold = Key("cold-root", "cold")
@@ -172,9 +201,9 @@ class HybridPlacementTests(unittest.TestCase):
         current = self.linear(4, 2)
         self.history.bind(full)
         self.history.commit_linear([old, current])
-        cases = (({old: 1, full[0]: 1}, full[1:], 1),
-                 ({old: 1, full[0]: 1}, full[1:2], 1),
-                 ({old: 1}, full[1:], 2))
+        cases = (({old: 1, full[0]: 1}, full[1:], 2),
+                 ({old: 1, full[0]: 1}, full[1:2], 2),
+                 ({old: 1}, full[1:], 4))
         for disk, resident_full, expected_cost in cases:
             with self.subTest(disk=disk, resident_full=resident_full):
                 dram = {key: 1 for key in [*resident_full, current]}
@@ -183,7 +212,7 @@ class HybridPlacementTests(unittest.TestCase):
                 self.assertEqual(decision.key, current)
                 self.assertEqual(decision.drop_cost, expected_cost)
 
-    def test_plans_replacement_at_most_once_for_each_kind(self):
+    def test_reuses_replacement_plan_for_equal_space_and_protection(self):
         full = [HybridKey(str(n), f"session-{n}") for n in range(4)]
         linear = [self.linear(n, 1, session=f"other-{n}") for n in range(1, 5)]
         victim = HybridKey("victim")
@@ -191,9 +220,9 @@ class HybridPlacementTests(unittest.TestCase):
             self.history.bind([key])
         self.history.commit_linear(linear)
         dram = dict.fromkeys([*full, *linear], 1)
-        with patch("bidaw.gandalf_policy.plan_victims", return_value=((victim,), 0, 0)) as plan:
+        with patch("bidaw.gandalf_policy.plan_victims", return_value=((victim,), 1)) as plan:
             choose(dram, set(dram), {victim: 1}, set(), 1, self.history, 1, lambda _: .01, 1)
-        self.assertEqual(plan.call_count, 2)
+        self.assertEqual(plan.call_count, 1)
 
 
 class FakeAdapter:

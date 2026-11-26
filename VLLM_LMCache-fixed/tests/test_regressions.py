@@ -81,6 +81,7 @@ class DistanceTests(unittest.TestCase):
             k, weight = rng.randrange(80), rng.randrange(256)
             prev = next((i for i in range(len(trace)-1, -1, -1) if trace[i][0] == k), None)
             expected = None if prev is None else sum(dict(trace[prev+1:]).values())
+            self.assertEqual(tracker.current_distance(k), expected)
             self.assertEqual(tracker.access(k, weight), expected)
             trace.append((k, weight))
 
@@ -88,6 +89,8 @@ class DistanceTests(unittest.TestCase):
         tracker = ReuseDistance(max_keys=2)
         for k in 'ABC':
             tracker.access(k)
+        self.assertIsNone(tracker.current_distance('A'))
+        self.assertEqual(tracker.current_distance('A', previously_seen=True), 2)
         self.assertIsNone(tracker.access('A'))
         self.assertLessEqual(len(tracker.last), 2)
 
@@ -213,7 +216,26 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.p._lb_min, {})
         self.p.on_answer('u', 64)
         for _ in range(12): self.p._record_wrd('u', 5)
-        self.assertEqual(self.p._lb_min, {64: 5})
+        self.assertEqual(self.p._answer_lower_bound(64), 5)
+
+    def test_lower_bound_pools_lengths_in_one_bin_and_filters_low_outliers(self):
+        for answer, wrd in zip(range(32, 40), (0, 100, 100, 100, 100, 100, 100, 100)):
+            self.p.on_answer('u', answer)
+            self.p._record_wrd('u', wrd)
+        self.assertEqual(self.p._answer_lower_bound(32), 100)
+        self.assertEqual(self.p._answer_lower_bound(63), 100)
+
+    def test_lower_bound_curve_is_monotone_and_interpolates_missing_bins(self):
+        # Bin centers 16, 48 and 112 initially have bounds 30, 20 and 60.
+        for length, wrd in ((16, 30), (48, 20), (112, 60)):
+            self.p.on_answer('u', length)
+            for _ in range(8):
+                self.p._record_wrd('u', wrd)
+        self.assertEqual(self.p._lb_curve, ((16, 20), (48, 20), (112, 60)))
+        self.assertEqual(
+            [self.p._answer_lower_bound(length) for length in (0, 16, 48, 80, 112, 250)],
+            [20, 20, 20, 40, 60, 60],
+        )
 
     def test_unknown_answer_is_not_scored_in_the_short_answer_bin(self):
         unknown = key('a', 'unknown')
@@ -236,11 +258,34 @@ class PolicyTests(unittest.TestCase):
         self.p._extreme_threshold = 96
         self.p._salt_hist['u'].extend([15, 17, 24, 27])
         self.p.on_answer('u', 64)
-        self.p._lb_min[64] = 24
         self.p._ghost = (1.0, [0.5, 0.2] + [0] * 6, 0)
-        self.assertAlmostEqual(self.p._potential('u', respect_lb=True), 0.4)
-        self.p.on_answer('u', 65)
-        self.assertAlmostEqual(self.p._potential('u', respect_lb=True), 0.55)
+        with patch.object(self.p, '_answer_lower_bound', return_value=24):
+            self.assertAlmostEqual(self.p._potential('u', respect_lb=True), 0.4)
+            self.assertAlmostEqual(self.p._potential('u', respect_lb=False), 0.55)
+
+    def test_potential_conditions_on_larger_of_current_distance_and_answer_bound(self):
+        self.p._capacity_bytes = 16
+        self.p._extreme_threshold = 96
+        self.p._ghost = (1.0, [0.5, 0.2] + [0] * 6, 0)
+        self.p._salt_hist['u'].extend([15, 17, 24, 27])
+        self.p.on_conversation_access('u', 10)
+        self.p.on_conversation_access('v', 27)
+        self.p.on_answer('u', 64)
+        with patch.object(self.p, '_answer_lower_bound', return_value=17):
+            self.assertAlmostEqual(self.p._potential('u', respect_lb=True), 0.2)
+        with patch.object(self.p, '_answer_lower_bound', return_value=96):
+            self.assertEqual(self.p._potential('u', respect_lb=True), 0.0)
+            self.assertAlmostEqual(self.p._potential('u', respect_lb=False), 0.2)
+
+    def test_stale_session_can_be_evicted_without_a_completed_reuse_sample(self):
+        stale, recent = key('A', 'stale'), key('B', 'recent')
+        self.p.on_keys_created([recent, stale])
+        self.p.on_conversation_access('stale', 1)
+        self.p.on_conversation_access('recent', int(self.p._extreme_threshold))
+        self.assertEqual(self.p._potential('stale', respect_lb=True), 0.0)
+        self.assertEqual(self.p._potential('recent', respect_lb=True), 0.5)
+        actions = self.p.get_eviction_actions(.5)
+        self.assertEqual([k for action in actions for k in action.keys], [stale])
 
 
 class Tokenizer:
@@ -497,7 +542,7 @@ class ReportTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
-    def make_controller(self, enabled):
+    def make_controller(self, enabled, l2_concurrency=4):
         from bidaw.dual_queue_scheduler import apply_dual_queue_patch
         class Controller:
             def __init__(self):
@@ -508,8 +553,10 @@ class SchedulerTests(unittest.TestCase):
                 self._pending_queue = deque()
                 self._in_flight_requests = {}
                 self._l2_adapters = [1]
+                self._adapter_descriptors = {1: object()}
                 self.released = []
                 self.started = []
+                self.reserved = []
                 self.loaded = []
                 self.finished = []
                 def notify():
@@ -519,19 +566,23 @@ class SchedulerTests(unittest.TestCase):
             def _start_pending_requests(self): pass
             def _lock_l1_keys(self,request): pass
             def _release_all_locks(self,request): self.released.append(request.request_id)
-            def _plan_load(self,*a): pass
+            def _is_l2_eligible(self,request,index): return True
+            def _plan_load(self,request,adapters):
+                row = types.SimpleNamespace(popcount=lambda: request.l2_cells)
+                request.key_states.l2_locked_keys = {1: [row]} if adapters else {}
             def _finish_request(self,request): self.finished.append(request.request_id)
             def _can_admit_new_prefetch(self,spec): return True
             def _start_lookup_phase(self,rid,spec):
                 self.started.append(rid)
                 self._in_flight_requests[rid] = build(rid, spec)
-            def _advance_request(self,request,adapters): pass
-            def _poll_lookup_results(self,request,adapters): pass
+            def _advance_request(self,request,adapters):
+                if adapters.get('load') and request.all_loads_done():
+                    self._finish_request(request)
+                    self._retire_request(request)
+            def _poll_lookup_results(self,request,adapters): request.phase = 'load'
             def _transition_to_load_phase(self,request):
-                reserved = {0: types.SimpleNamespace(get_size=lambda: request.load_bytes)}
-                self._submit_load_tasks(request, reserved if request.load_bytes else {})
-            def _submit_load_tasks(self,request,reserved):
-                if reserved:
+                self.reserved.append(request.request_id)
+                if request.l2_cells:
                     self.loaded.append(request.request_id)
                     request.all_loads_done = lambda: False
             def _retire_request(self,request): self._in_flight_requests.pop(request.request_id)
@@ -539,7 +590,7 @@ class SchedulerTests(unittest.TestCase):
         def build(rid,spec):
             return types.SimpleNamespace(request_id=rid, key_groups=spec.key_groups,
                 key_states=types.SimpleNamespace(l1_locked_keys={}), fetching_policy=spec.needs_l2,
-                phase='lookup', load_bytes=spec.load_bytes, all_lookups_done=lambda: True,
+                phase='lookup', l2_cells=spec.l2_cells, all_lookups_done=lambda: True,
                 all_loads_done=lambda: True)
         pc = module('prefetch_controller', PrefetchController=Controller,
                     _build_request=build, _needs_l2_lookup=lambda a,b,c:c,
@@ -548,15 +599,17 @@ class SchedulerTests(unittest.TestCase):
                     logger=logging.getLogger('test'))
         stubs = lmcache_stubs()
         stubs['lmcache.v1.distributed.storage_controllers'] = module('storage_controllers',prefetch_controller=pc)
-        with patch.dict(sys.modules, stubs), patch.dict(os.environ, BIDAW_DUAL_QUEUE=str(int(enabled))):
+        settings = dict(BIDAW_DUAL_QUEUE=str(int(enabled)),
+                        BIDAW_L2_READ_CONCURRENCY=str(l2_concurrency))
+        with patch.dict(sys.modules, stubs), patch.dict(os.environ, settings):
             apply_dual_queue_patch()
         return Controller
 
-    def spec(self, n=1, needs_l2=True, load_bytes=1, salt='u'):
+    def spec(self, n=1, needs_l2=True, l2_cells=1, salt='u'):
         layout = types.SimpleNamespace(shapes=4, dtypes=None)
         group = types.SimpleNamespace(keys=[key(i, salt) for i in range(n)], layout_desc=layout)
         return types.SimpleNamespace(key_groups=[group], allowed_l2_memory_tags=None,
-                                     needs_l2=needs_l2, load_bytes=load_bytes)
+                                     needs_l2=needs_l2, l2_cells=l2_cells)
 
     def test_fast_lane_has_no_timestamp_leak(self):
         C = self.make_controller(True); c = C()
@@ -566,11 +619,11 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(c._bidaw_enqueue_monotonic, {})
         self.assertEqual(c._submission_queue, [])
 
-    def test_disk_hrrn_ranks_reserved_bytes_and_keeps_abcu_dispatch_event(self):
-        C = self.make_controller(True); c, other = C(), C()
-        c.submit_prefetch_request(self.spec(5, load_bytes=500))
-        c.submit_prefetch_request(self.spec(500, load_bytes=5))
-        c.submit_prefetch_request(self.spec(5, load_bytes=0))
+    def test_disk_hrrn_limits_inflight_and_ranks_planned_bytes_before_reserving(self):
+        C = self.make_controller(True, l2_concurrency=1); c, other = C(), C()
+        c.submit_prefetch_request(self.spec(100, l2_cells=100))
+        c.submit_prefetch_request(self.spec(500, l2_cells=1))
+        c.submit_prefetch_request(self.spec(5, l2_cells=0))
         self.assertEqual(other._bidaw_enqueue_monotonic, {})
         c._pending_queue.extend(c._submission_queue)
         c._submission_queue.clear()
@@ -582,15 +635,30 @@ class SchedulerTests(unittest.TestCase):
         for request in list(c._in_flight_requests.values()):
             c._advance_request(request, {'lookup': {1}})
         self.assertEqual(c.loaded, [])
+        self.assertEqual(c.reserved, [])
         self.assertEqual(c.finished, [3])
         with patch.object(l2_event_probe, '_log') as log:
             c._start_pending_requests()
-        self.assertEqual(c.loaded, [2, 1])
+            c.submit_prefetch_request(self.spec(500, l2_cells=1))
+            c._pending_queue.extend(c._submission_queue)
+            c._submission_queue.clear()
+            c._start_pending_requests()
+            c._bidaw_enqueue_monotonic[4] = time.monotonic() - .005
+            c._advance_request(c._in_flight_requests[4], {'lookup': {1}})
+            c._start_pending_requests()
+            self.assertEqual(c.reserved, [2])
+            self.assertEqual(set(c._bidaw_disk_ready), {1, 4})
+            for rid in (2, 4, 1):
+                request = c._in_flight_requests[rid]
+                request.all_loads_done = lambda: True
+                c._advance_request(request, {'load': {1}})
+                c._start_pending_requests()
+        self.assertEqual(c.loaded, [2, 4, 1])
+        self.assertEqual(c.reserved, c.loaded)
         self.assertEqual(log.call_args_list[0].args, ('preparing', [{'request': f'{id(c)}:2'}]))
-        self.assertEqual(log.call_count, 2)
+        self.assertEqual(log.call_count, 3)
         self.assertEqual(c._bidaw_disk_ready, {})
-        for request in list(c._in_flight_requests.values()):
-            c._retire_request(request)
+        self.assertEqual(c._bidaw_disk_in_flight, set())
         self.assertEqual(c._bidaw_enqueue_monotonic, {})
 
     def test_metadata_admission_skips_head_and_cleanup_releases_waiting_pins(self):

@@ -7,8 +7,8 @@ Bidirectional Computation-Storage Awareness`` (Hu et al., FAST'26):
 
 * Per-user (``cache_salt``) weighted-reuse-distance (WRD) tracking, updated
   from logical lookup submissions, independently of L1 lifecycle events.
-* Online lower-bound curve: the minimum inlier WRD per previous-round
-  answer length (paper section 3.3.1, Spearman 0.94-0.98 observation).
+* Online lower-bound curve fitted to the minimum inlier WRD in each
+  previous-answer length bin (paper section 3.3.1).
 * A byte-budgeted ghost cache that replays recent accesses with known future
   uses in that window (paper sections 3.3.2 and 3.3.3).
 * Eviction candidates with a salt are selected at user granularity by
@@ -24,6 +24,7 @@ import math
 import os
 import threading
 import time
+from bisect import bisect_left
 from collections import OrderedDict, defaultdict, deque
 
 from bidaw.reuse_distance import ReuseDistance
@@ -38,6 +39,8 @@ from lmcache.v1.distributed.internal_api import (
 )
 
 logger = init_logger(__name__)
+
+_ANSWER_BIN_TOKENS = 32
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -83,7 +86,8 @@ class BidawEvictionPolicy(EvictionPolicy):
             lambda: deque(maxlen=64)
         )
         self._salt_last_answer: dict[str, int] = {}
-        self._lb_min: dict[int, int] = {}  # answer length -> min WRD in bytes
+        self._lb_min: dict[int, int] = {}  # answer bin center -> min inlier WRD
+        self._lb_curve: tuple[tuple[int, int], ...] = ()
         self._trace: deque = deque(maxlen=self._ghost_window)
         self._ghost = None                   # (small, [prom...], built_at)
         self._ghost_built_seq = 0
@@ -221,9 +225,9 @@ class BidawEvictionPolicy(EvictionPolicy):
                 "capacity_keys": self._capacity_keys,
                 "capacity_bytes": self._capacity_bytes,
                 "last_answers": dict(list(self._salt_last_answer.items())[-8:]),
+                "lb_bin_tokens": _ANSWER_BIN_TOKENS,
                 "lb_curve": {
-                    str(k): round(v, 1)
-                    for k, v in sorted(self._lb_min.items())[:16]
+                    str(length): bound for length, bound in self._lb_curve[:16]
                 },
                 "ghost": ghost,
             }
@@ -270,14 +274,45 @@ class BidawEvictionPolicy(EvictionPolicy):
         answer_length = self._salt_last_answer.get(salt)
         if answer_length is None:
             return
-        samples = self._lb_samples[answer_length]
+        bin_start = answer_length // _ANSWER_BIN_TOKENS * _ANSWER_BIN_TOKENS
+        center = bin_start + _ANSWER_BIN_TOKENS // 2
+        samples = self._lb_samples[center]
         samples.append(wrd)
         if len(samples) < 8:
             return
         ordered = sorted(samples)
         q1, q3 = ordered[len(ordered) // 4], ordered[3 * len(ordered) // 4]
         lower_fence = q1 - 1.5 * (q3 - q1)
-        self._lb_min[answer_length] = next(x for x in ordered if x >= lower_fence)
+        bound = next(x for x in ordered if x >= lower_fence)
+        if self._lb_min.get(center) != bound:
+            self._lb_min[center] = bound
+            self._fit_lb_curve()
+
+    def _fit_lb_curve(self) -> None:
+        # Right-to-left minima give the greatest nondecreasing curve whose
+        # knots never exceed the observed minimum inlier in their bin.
+        curve = []
+        for length, bound in sorted(self._lb_min.items(), reverse=True):
+            if curve:
+                bound = min(bound, curve[-1][1])
+            curve.append((length, bound))
+        self._lb_curve = tuple(reversed(curve))
+
+    def _answer_lower_bound(self, answer_length: int) -> int:
+        curve = self._lb_curve
+        if not curve:
+            return 0
+        index = bisect_left(curve, answer_length, key=lambda knot: knot[0])
+        if index == 0:
+            return curve[0][1]
+        if index == len(curve):
+            return curve[-1][1]
+        left_length, left_bound = curve[index - 1]
+        right_length, right_bound = curve[index]
+        return left_bound + (
+            (answer_length - left_length) * (right_bound - left_bound)
+            // (right_length - left_length)
+        )
 
     @staticmethod
     def _key_id(key: ObjectKey) -> tuple:
@@ -407,13 +442,19 @@ class BidawEvictionPolicy(EvictionPolicy):
 
     def _potential(self, salt: str, respect_lb: bool) -> float:
         """Expected hit rate of this salt's next access (paper eq. 2)."""
+        current = self._reuse.current_distance(
+            ("conversation", salt), previously_seen=salt in self._salt_last_touch
+        )
+        answer_len = self._salt_last_answer.get(salt) if respect_lb else None
+        answer_lb = self._answer_lower_bound(answer_len) if answer_len is not None else 0
+        first_bucket = self._bucket_of(max(current or 0, answer_lb))
+        if first_bucket[0] == 2:
+            return 0.0
+
         hist = self._salt_hist.get(salt)
         if not hist:
-            return 0.5  # no evidence: neutral; recency breaks ties
+            return 0.5 if first_bucket == (0, 0) else self._bucket_hit(*first_bucket)
 
-        answer_len = self._salt_last_answer.get(salt)
-        lb = self._lb_min.get(answer_len) if respect_lb and answer_len is not None else None
-        first_bucket = self._bucket_of(lb) if lb is not None else (0, 0)
         total = 0
         hits = 0.0
         for wrd in hist:

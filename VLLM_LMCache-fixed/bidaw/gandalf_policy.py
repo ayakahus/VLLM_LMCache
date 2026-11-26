@@ -2,7 +2,8 @@
 """Online hybrid-cache placement using the normalized costs in Gandalf §3.3."""
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, replace
-from heapq import heappop, heappush
+from functools import lru_cache
+from heapq import heapify, heappop, heappush
 from threading import RLock
 
 
@@ -170,8 +171,7 @@ def plan_victims(disk, protected, dram, dram_children, ssd_children,
         victims.append(victim)
         needed -= disk[victim]
         if needed <= 0:
-            return (tuple(victims), sum(costs[key][0] for key in victims),
-                    min(costs[key][1] for key in victims))
+            return tuple(victims), sum(costs[key][0] for key in victims)
         parent = parents.get(victim)
         if parent in remaining:
             child_count[parent] -= 1
@@ -242,12 +242,16 @@ def choose(dram, eligible, disk, pinned, capacity, history, recompute_price,
         return max(1, boundary - fallback)
 
     def leaf_cost(key, size):
-        age, reuse = activity.get(key.cache_salt, (1, 0.5))
         state = states.get(key)
         if state == "superseded":
             return 0.0, 0.0
-        chunks = rollback_chunks(key) if state else 1
-        cost = reuse * recompute_price * chunks
+        age, return_probability = activity.get(key.cache_salt, (1, 0.5))
+        # Eq. 7 charges for the next read. A live checkpoint has one
+        # remaining use under the append-only placement model.
+        if state == "live":
+            cost = recompute_price * rollback_chunks(key)
+        else:
+            cost = return_probability * recompute_price
         return cost, cost / (size * age)
 
     disk_prefix = {}
@@ -263,7 +267,9 @@ def choose(dram, eligible, disk, pinned, capacity, history, recompute_price,
         return complete
 
     best_drop = None
-    representatives = {}
+    move_candidates = []
+    write_costs = {}
+    used = sum(disk.values())
     for key in candidates:
         size = dram[key]
         state = states.get(key)
@@ -275,30 +281,42 @@ def choose(dram, eligible, disk, pinned, capacity, history, recompute_price,
         if (key in disk or size > capacity
                 or (not state and (key not in parents or not has_disk_ancestors(key)))):
             continue
-        kind = "linear" if state else "full"
         age, _ = activity.get(key.cache_salt, (1, 0.5))
-        if kind not in representatives or age > representatives[kind][1]:
-            representatives[kind] = (key, age)
+        normalization = size * age
+        if size not in write_costs:
+            write_costs[size] = size * write_price(size)
+        write_cost = write_costs[size]
+        move_candidates.append(
+            (write_cost / normalization, len(move_candidates), key, normalization, write_cost)
+        )
 
-    used = sum(disk.values())
-    best_move = None
-    # Plan SSD replacement only for the at-most-two representatives.
-    if any(used + dram[key] > capacity for key, _ in representatives.values()):
+    if any(used + dram[key] > capacity for _, _, key, _, _ in move_candidates):
         ssd_costs = {key: (0.0, 0.0) if key in dram else leaf_cost(key, size)
                      for key, size in disk.items()}
         order = {key: index for index, key in enumerate(disk)}
-    for key, age in representatives.values():
-        size = dram[key]
-        needed = used + size - capacity
-        plan = ((), 0.0, 0.0) if needed <= 0 else plan_victims(
-            disk, pinned | set(ancestors(key)), dram, dram_children, ssd_children,
-            parents, ssd_costs, order, needed,
+
+    @lru_cache(maxsize=32)
+    def replacement_plan(protected, needed):
+        return plan_victims(
+            disk, protected, dram, dram_children, ssd_children, parents, ssd_costs,
+            order, needed,
+        )
+
+    best_move = None
+    heapify(move_candidates)
+    while move_candidates:
+        write_score, _, key, normalization, write_cost = heappop(move_candidates)
+        # Replacement costs are nonnegative, so no later candidate can win.
+        if best_move is not None and write_score >= best_move.move_score:
+            break
+        needed = used + dram[key] - capacity
+        plan = ((), 0.0) if needed <= 0 else replacement_plan(
+            frozenset(pinned.union(ancestors(key))), needed,
         )
         if plan is None:
             continue
-        victims, replacement, replacement_score = plan
-        write_cost = size * write_price(size)
-        score = write_cost / (size * age) + replacement_score
+        victims, replacement = plan
+        score = write_score + replacement / normalization
         if best_move is None or score < best_move.move_score:
             best_move = Decision(key, "move", victims, write_cost=write_cost,
                                  replacement_cost=replacement, move_score=score)

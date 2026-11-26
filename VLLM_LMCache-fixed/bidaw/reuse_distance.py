@@ -37,6 +37,17 @@ class ReuseDistance:
             self._add(pos, weight)
         self.clock = len(self.last)
 
+    def current_distance(self, key, *, previously_seen=False) -> int | None:
+        """Read the accumulated distance without updating recency or samples."""
+        previous = self.last.get(key)
+        if previous is not None:
+            return self._sum(self.clock) - self._sum(previous[0])
+        if previously_seen:
+            # An expired identity predates every retained position. The
+            # retained weight is a lower bound on its accumulated distance.
+            return self._sum(self.clock)
+        return None
+
     def access(self, key, weight=1):
         if self.clock == self.size:
             self._compact()
