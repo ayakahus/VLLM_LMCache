@@ -11,10 +11,11 @@ cache bucket hit rates, lower-bound curve).
 """
 
 # Standard
+import os
 from typing import Any, Literal
 
 # Third Party
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 # First Party
@@ -59,7 +60,7 @@ def report_shared_replay_end() -> dict[str, bool]:
 
 
 @router.get("/bidaw/status")
-def bidaw_status() -> dict[str, Any]:
+def bidaw_status(request: Request) -> dict[str, Any]:
     status = policy_registry.snapshot_status()
     status["padded_tail_store"] = padded_tail.PADDED_TAIL_STORE_ENABLED
     # Scheduler section appears only when the dual-queue patch is enabled.
@@ -72,6 +73,11 @@ def bidaw_status() -> dict[str, Any]:
     from bidaw.gandalf_runtime import status as tier_status
 
     tier = tier_status()
+    if os.environ.get("DISABLE_L2") == "1":
+        storage = request.app.state.engine.storage_manager.report_status()
+        tier = dict(mode="l1_only", num_l2_adapters=storage["num_l2_adapters"],
+                    l1_capacity_bytes=storage["l1_capacity_bytes_by_backend"]["dram"],
+                    capacity_bytes=0, writes=0, write_bytes=0, reads=0)
     if tier is not None:
         status["tier_policy"] = tier
     return status

@@ -218,7 +218,7 @@ def _key_fields(key):
     return fields
 
 
-def apply_l2_event_probe() -> bool:
+def apply_l2_event_probe(*, l1_only: bool = False) -> bool:
     global _log
     out = os.environ.get("BIDAW_L2_EVENT_LOG")
     if not out:
@@ -227,7 +227,6 @@ def apply_l2_event_probe() -> bool:
         return True
 
     from lmcache.v1.distributed.l1_manager.base import BaseL1Manager
-    from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2Adapter
     from lmcache.v1.distributed.storage_manager import StorageManager
     from lmcache.v1.distributed.storage_controllers import (
         eviction_controller as ec,
@@ -257,10 +256,6 @@ def apply_l2_event_probe() -> bool:
     def log_keys(event, keys, extras, timestamp=None):
         log(event, ({**_key_fields(key), **extras} for key in keys), timestamp)
 
-    notify_stored = FSL2Adapter._notify_keys_stored
-    notify_accessed = FSL2Adapter._notify_keys_accessed
-    execute_load = FSL2Adapter._execute_load
-    execute_delete = FSL2Adapter._execute_delete
     submit_prefetch = StorageManager.submit_prefetch_task
     submit_loads = pc.PrefetchController._submit_load_tasks
     publish_result = pc.PrefetchController._publish_result
@@ -397,16 +392,23 @@ def apply_l2_event_probe() -> bool:
 
     log("probe_on", [{"version": 4}])
     log("timing_probe_on", [{"version": 1}])
-    FSL2Adapter._notify_keys_stored = stored
-    FSL2Adapter._notify_keys_accessed = accessed
-    FSL2Adapter._execute_load = load
-    FSL2Adapter._execute_delete = delete
+    if not l1_only:
+        from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2Adapter
+
+        notify_stored = FSL2Adapter._notify_keys_stored
+        notify_accessed = FSL2Adapter._notify_keys_accessed
+        execute_load = FSL2Adapter._execute_load
+        execute_delete = FSL2Adapter._execute_delete
+        FSL2Adapter._notify_keys_stored = stored
+        FSL2Adapter._notify_keys_accessed = accessed
+        FSL2Adapter._execute_load = load
+        FSL2Adapter._execute_delete = delete
+        pc.PrefetchController._submit_load_tasks = schedule_loads
+        ec.L2EvictionController._execute_eviction_action = l2_action
     StorageManager.submit_prefetch_task = prefetch
-    pc.PrefetchController._submit_load_tasks = schedule_loads
     pc.PrefetchController._publish_result = publish
     ec.L1EvictionController.__init__ = init_l1_controller
     ec.L1EvictionController.execute_eviction_action = l1_action
-    ec.L2EvictionController._execute_eviction_action = l2_action
     BaseL1Manager._free_and_report_deleted = l1_removed
     _install_transfer_timing(log, StorageManager)
     _log = log

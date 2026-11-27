@@ -18,6 +18,10 @@ import sys
 
 
 def _rewrite_argv() -> None:
+    if os.environ.get("DISABLE_L2") == "1":
+        os.environ.pop("BIDAW_FORCE_POLICY", None)
+        os.environ["BIDAW_DUAL_QUEUE"] = "0"
+        return
     if "--eviction-policy" in sys.argv:
         i = sys.argv.index("--eviction-policy")
         if i + 1 < len(sys.argv) and sys.argv[i + 1] == "Bidaw":

@@ -3,6 +3,14 @@
 """Compare the two frozen-trace policy arms and write a report file."""
 import json
 from pathlib import Path
+import sys
+
+if __name__ == "__main__" and len(sys.argv) > 1:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from bidaw.gandalf_report import main
+
+    main()
+    raise SystemExit
 
 D = str(Path(__file__).resolve().parents[1] / "logs") + "/"
 OUT = D + "trace70_comparison.txt"
@@ -28,8 +36,9 @@ for name, policy in ARMS:
     lines.append(f"  rounds_ok={n}  stores={a.get('lmcache_mp_num_finished_stores_total', 0):.0f}"
                  f"  retrieves={a.get('lmcache_mp_num_finished_retrieves_total', 0):.0f}"
                  f"  chunks_loaded={a.get('lmcache_mp_num_chunks_loaded_total', 0):.0f}")
-    lines.append(f"  hit_rate={hit / req:.4f}  (req={req:.0f})")
-    lines.append(f"    L1_hit={h1:.0f} ({h1 / req:.1%})   L2_hit={h2:.0f} ({h2 / req:.1%})")
+    l1_rate, l2_rate = (h1 / req, h2 / req) if req else (0.0, 0.0)
+    lines.append(f"  hit_rate={hit / req if req else 0:.4f}  (req={req:.0f})")
+    lines.append(f"    L1_hit={h1:.0f} ({l1_rate:.1%})   L2_hit={h2:.0f} ({l2_rate:.1%})")
     lines.append(f"  TTFT p10={tt[int(n * 0.10)]:.0f}  p50={tt[int(n * 0.50)]:.0f}"
                  f"  p90={tt[int(n * 0.90)]:.0f}  p99={tt[int(n * 0.99)]:.0f}"
                  f"  max={tt[-1]:.0f} ms")

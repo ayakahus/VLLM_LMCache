@@ -43,7 +43,8 @@ BACKGROUND_METRICS = {
     "selection": "Eviction candidate selection",
     "ssd_write": "Migration SSD write",
 }
-QUANTILES = {"p50": .50, "p95": .95, "p99": .99}
+QUANTILES = {"p50": .50, "p90": .90, "p95": .95, "p99": .99}
+ARM_COLORS = dict(zip(ARMS, ("#326a96", "#42806b", "#b87b30", "#a44f62", "#695996"), strict=True))
 SAMPLE_RE = re.compile(r'^([^\s{]+)(?:\{([^}]*)\})?\s+(\S+)')
 LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
@@ -327,6 +328,10 @@ def summarize(run_root):
             counters.store_samples += counts.store_samples
             if counts.queue_estimate is not None:
                 estimates.append(counts.queue_estimate)
+        if not samples["client_ttft"]:
+            continue
+        if arm == "l1_only":
+            samples["ssd_per_request"] = [0.0] * len(samples["client_ttft"])
         metrics = {name: stats(samples[name], "replay" if name == "client_ttft" else "events")
                    for name in PATH_METRICS | BACKGROUND_METRICS}
         for name, histogram in histograms.items():
@@ -352,7 +357,7 @@ def display(value):
 def render(results):
     lines = []
     for title, group, columns in (
-        ("TTFT critical path (ms)", PATH_METRICS, ("mean", "p50", "p95", "p99")),
+        ("TTFT critical path (ms)", PATH_METRICS, ("mean", "p50", "p90", "p95", "p99")),
         ("Background writes and eviction (ms)", BACKGROUND_METRICS, ("mean", "p95", "p99")),
     ):
         lines.extend([f"## {title}", "", "| Arm | Metric | Samples | " + " | ".join(columns) + " |",
@@ -388,17 +393,16 @@ def plot(results, output):
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 13), layout="constrained")
-    colors = ("#326a96", "#42806b", "#b87b30", "#a44f62")
     for ax, group, title in zip(axes, (PATH_METRICS, BACKGROUND_METRICS),
                                 ("TTFT and request stages", "Background write and eviction"), strict=True):
         indexes = list(range(len(group)))
         for number, (arm, result) in enumerate(results.items()):
-            positions = [i + (number - 1.5) * .18 for i in indexes]
+            positions = [i + (number - (len(results) - 1) / 2) * .14 for i in indexes]
             means = [(result["metrics_ms"][name] or {}).get("mean") for name in group]
             points = [(value, position) for position, value in zip(positions, means, strict=True)
                       if value is not None]
             xs, ys = zip(*points) if points else ([], [])
-            ax.scatter(xs, ys, color=colors[number], label=arm)
+            ax.scatter(xs, ys, color=ARM_COLORS[arm], label=arm)
         ax.set_yticks(indexes, group.values())
         for index, name in enumerate(group):
             if all(result["metrics_ms"][name] is None for result in results.values()):
@@ -407,7 +411,7 @@ def plot(results, output):
         ax.set_title(title, loc="left")
         ax.set_xlabel("Mean latency (ms)")
         ax.grid(axis="x", alpha=.25)
-        ax.legend(ncol=4, loc="lower right")
+        ax.legend(ncol=len(results), loc="lower right")
     fig.savefig(output, dpi=150)
     plt.close(fig)
 
@@ -427,10 +431,10 @@ def plot_with_pillow(results, output):
             return ImageFont.load_default(size=size)
 
     text_font, title_font = font(18), font(26)
-    colors = ("#326a96", "#42806b", "#b87b30", "#a44f62")
+    colors = [ARM_COLORS[arm] for arm in results]
     draw.text((42, 24), "Mean latency by policy (ms)", fill="#182930", font=title_font)
     for i, (arm, color) in enumerate(zip(results, colors, strict=True)):
-        x = 44 + 270 * i
+        x = 44 + 244 * i
         draw.ellipse((x, 75, x + 12, 87), fill=color)
         draw.text((x + 24, 70), arm, fill="#182930", font=text_font)
     for top, group, title in (
@@ -456,7 +460,7 @@ def plot_with_pillow(results, output):
             for i, (value, color) in enumerate(zip(values, colors, strict=True)):
                 if value is not None:
                     x = left + value * (right - left) / maximum
-                    point_y = y + (i - 1.5) * 8
+                    point_y = y + (i - (len(results) - 1) / 2) * 8
                     draw.ellipse((x - 4, point_y - 4, x + 4, point_y + 4), fill=color)
     image.save(output)
 
@@ -466,6 +470,8 @@ def main():
     parser.add_argument("run_root", type=Path, help="Directory containing repeat-*/<arm>/")
     args = parser.parse_args()
     results = summarize(args.run_root)
+    if not results:
+        parser.error("No measured requests found")
     root = args.run_root
     report = render(results)
     (root / "ttft_breakdown.txt").write_text(report, encoding="utf-8")

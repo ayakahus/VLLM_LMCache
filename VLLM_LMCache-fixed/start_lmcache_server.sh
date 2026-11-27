@@ -29,8 +29,19 @@ export BIDAW_L1_CAPACITY_KEYS="${BIDAW_L1_CAPACITY_KEYS:-$(python3 -c \
     "$L1_GB" "$BIDAW_CHUNK_BYTES")}"
 export BIDAW_EVICTION_WATERMARK="${BIDAW_EVICTION_WATERMARK:-0.95}"
 EVICTION_POLICY="${EVICTION_POLICY:-Bidaw}"
-mkdir -p "${DEMO_DIR}/logs" "$LMCACHE_L2_PATH"
-l2_adapter=$(python3 -c 'import json,sys; print(json.dumps(dict(type="fs", base_path=sys.argv[1])))' "$LMCACHE_L2_PATH")
+if [[ "${POLICY:-}" == l1_only || "$EVICTION_POLICY" == l1_only ]]; then
+    export DISABLE_L2=1
+fi
+mkdir -p "${DEMO_DIR}/logs"
+L2_ARGS=()
+if [[ "${DISABLE_L2:-0}" == 1 ]]; then
+    EVICTION_POLICY=LRU
+    LMCACHE_L2_PATH=disabled
+else
+    mkdir -p "$LMCACHE_L2_PATH"
+    l2_adapter=$(python3 -c 'import json,sys; print(json.dumps(dict(type="fs", base_path=sys.argv[1])))' "$LMCACHE_L2_PATH")
+    L2_ARGS=(--l2-prefetch-policy retain --l2-adapter "$l2_adapter")
+fi
 
 export LMCACHE_LOG_LEVEL="${LMCACHE_LOG_LEVEL:-INFO}"
 CHUNK_SIZE=256
@@ -49,5 +60,4 @@ exec python3 -m bidaw.lmcache_server_entry server \
     --chunk-size "$CHUNK_SIZE" "${GROUP_ARGS[@]}" \
     --l1-size-gb "$L1_GB" \
     --eviction-policy "$EVICTION_POLICY" \
-    --l2-prefetch-policy retain \
-    --l2-adapter "$l2_adapter"
+    "${L2_ARGS[@]}"

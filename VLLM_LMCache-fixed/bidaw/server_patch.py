@@ -123,13 +123,14 @@ def _patch_watermark() -> None:
     the paper value onto every eviction config.  Controlled by
     ``BIDAW_EVICTION_WATERMARK``."""
     watermark = os.environ.get("BIDAW_EVICTION_WATERMARK", "0.95")
-    if watermark == "native":
+    l1_only = os.environ.get("DISABLE_L2") == "1"
+    if watermark == "native" and not l1_only:
         return
     try:
-        wm = float(watermark)
+        wm = None if watermark == "native" else float(watermark)
     except ValueError as exc:
         raise ValueError("Invalid BIDAW_EVICTION_WATERMARK") from exc
-    if not 0 < wm <= 1:
+    if wm is not None and not 0 < wm <= 1:
         raise ValueError("BIDAW_EVICTION_WATERMARK must be in (0, 1]")
 
     # Third Party (LMCache)
@@ -141,10 +142,12 @@ def _patch_watermark() -> None:
 
     def patched(args):  # noqa: ANN001
         cfg = original(args)
+        if l1_only and cfg.l2_adapter_config.adapters:
+            raise ValueError("DISABLE_L2=1 requires an empty L2 adapter configuration")
         for ev_cfg in [cfg.eviction_config] + [
             m.eviction for m in getattr(cfg, "l1_manager_configs", []) or []
         ]:
-            if ev_cfg is not None:
+            if ev_cfg is not None and wm is not None:
                 try:
                     object.__setattr__(ev_cfg, "trigger_watermark", wm)
                 except Exception:  # noqa: BLE001
@@ -155,14 +158,15 @@ def _patch_watermark() -> None:
     dcfg.parse_args_to_config = patched
 
 
-def _patch_l2_event_probe() -> None:
+def _patch_l2_event_probe(*, l1_only: bool = False) -> None:
     # Diagnostic chunk-lifecycle probe (BIDAW_L2_EVENT_LOG=<jsonl path>).
     from bidaw.l2_event_probe import apply_l2_event_probe
 
-    apply_l2_event_probe()
+    apply_l2_event_probe(l1_only=l1_only)
 
 
 def apply_all() -> None:
+    l1_only = os.environ.get("DISABLE_L2") == "1"
     if os.environ.get("BIDAW_PAD_TAIL") == "1":
         from bidaw.padded_tail import apply_padded_tail_store
 
@@ -171,10 +175,11 @@ def apply_all() -> None:
     _patch_http()
     if os.environ.get("BIDAW_FORCE_POLICY") == "Bidaw":
         _patch_conversation_lookup()
-    if "GANDALF_TIER_MODE" in os.environ:
+    if not l1_only and "GANDALF_TIER_MODE" in os.environ:
         from bidaw.gandalf_runtime import apply_tiering
 
         apply_tiering()
-    _patch_l2_event_probe()
-    _patch_dual_queue()
+    _patch_l2_event_probe(l1_only=l1_only)
+    if not l1_only:
+        _patch_dual_queue()
     _patch_watermark()

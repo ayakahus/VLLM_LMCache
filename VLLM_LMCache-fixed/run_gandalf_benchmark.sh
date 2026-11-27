@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run four cold-start arms on a dedicated, single-GPU experiment host.
+# Run cold-start arms on a dedicated, single-GPU experiment host.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 users=${GANDALF_USERS:-70}
@@ -11,11 +11,13 @@ l2_bytes=${GANDALF_L2_BYTES:-2147483648}
 seed=${GANDALF_SEED:-7}
 cache_root=${GANDALF_CACHE_ROOT:-"$PWD/l2_ssd/gandalf_benchmarks"}
 run_parent=${GANDALF_RUN_ROOT:-"$PWD/logs/gandalf_benchmarks"}
+trace_dir=${GANDALF_TRACE_DIR:-"$PWD/bidaw/trace_frozen"}
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export BIDAW_PAD_TAIL=0
-export BIDAW_EVICTION_WATERMARK=0.95
+export BIDAW_EVICTION_WATERMARK="${BIDAW_EVICTION_WATERMARK:-0.95}"
 export VLLM_WITHOUT_LMCACHE=0
 unset BIDAW_FORCE_POLICY
+unset POLICY
 export GANDALF_PARALLEL="$parallel"
 export GANDALF_HYBRID="${GANDALF_HYBRID:-0}"
 model_dir=models/Qwen2.5-1.5B-Instruct
@@ -26,30 +28,44 @@ if [[ "$GANDALF_HYBRID" == 1 ]]; then
                        --max-model-len 4096 --max-prompt-tokens 3800)
 fi
 
-arms=(lru lru_writeback bidaw gandalf)
+read -r -a arms <<< "${GANDALF_ARMS:-lru lru_writeback bidaw gandalf l1_only}"
+declare -A selected=()
+with_l2=0
+for arm in "${arms[@]}"; do
+    case "$arm" in
+        lru|lru_writeback|bidaw|gandalf) with_l2=1 ;;
+        l1_only) ;;
+        *) echo "Unknown GANDALF_ARMS entry: $arm" >&2; exit 2 ;;
+    esac
+    if [[ -v "selected[$arm]" ]]; then
+        echo "Duplicate GANDALF_ARMS entry: $arm" >&2
+        exit 2
+    fi
+    selected[$arm]=1
+done
 if [[ "${1:-}" == "--plan" ]]; then
     printf 'users=%s speed=%s parallel=%s repeats=%s L1_GiB=%s L2_bytes=%s seed=%s\n' \
         "$users" "$speed" "$parallel" "$repeats" "$l1_gb" "$l2_bytes" "$seed"
-    printf '%s\n' 'LRU immediate / FCFS' 'LRU writeback / FCFS' \
-        'Bidaw immediate / dual queue' 'Gandalf selective writeback / FCFS'
+    printf 'arms=%s trace_dir=%s\n' "${arms[*]}" "$trace_dir"
     exit 0
 fi
-if [[ $# != 0 || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
+if [[ $# != 0 || ${#arms[@]} == 0 || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
     echo "Usage: $0 [--plan] (GANDALF_REPEATS must be a positive integer)" >&2
     exit 2
 fi
 
 source ./env.sh
-python3 - "$users" "$speed" "$parallel" "$l1_gb" "$l2_bytes" "$model_dir" <<'PY'
+python3 - "$users" "$speed" "$parallel" "$l1_gb" "$l2_bytes" "$model_dir" "$with_l2" <<'PY'
 import math
 import socket
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import sys
 
-users, speed, parallel, dram, ssd, model = sys.argv[1:]
+users, speed, parallel, dram, ssd, model, with_l2 = sys.argv[1:]
 if (min(int(users), int(parallel)) <= 0 or min(float(speed), float(dram)) <= 0
-        or not all(math.isfinite(float(x)) for x in (speed, dram)) or int(ssd) < 7340032):
+        or not all(math.isfinite(float(x)) for x in (speed, dram))
+        or (with_l2 == "1" and int(ssd) < 7340032)):
     sys.exit("Invalid workload or capacity; L2 must fit at least one full KV chunk.")
 try:
     pinned = version("lmcache") == "0.5.7.post1" and version("vllm") == "0.33.0"
@@ -66,16 +82,21 @@ if not (Path(model) / "config.json").is_file():
     sys.exit(f"The local model is required: {model}")
 for port in (5555, 8080, 8000):
     with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind(("0.0.0.0", port))
         except OSError as exc:
             sys.exit(f"Port {port} must be available before starting the benchmark: {exc}")
 PY
 
-mkdir -p "$run_parent" "$cache_root"
+mkdir -p "$run_parent"
 run_root=$(mktemp -d "${run_parent}/run.XXXXXXXX")
-cache_run=$(mktemp -d "${cache_root}/run.XXXXXXXX")
-printf 'Reports: %s\nL2 directories: %s\n' "$run_root" "$cache_run"
+cache_run=
+if [[ "$with_l2" == 1 ]]; then
+    mkdir -p "$cache_root"
+    cache_run=$(mktemp -d "${cache_root}/run.XXXXXXXX")
+fi
+printf 'Reports: %s\nL2 directories: %s\n' "$run_root" "${cache_run:-disabled}"
 lmcache_pid=
 vllm_pid=
 stop_process() {
@@ -155,18 +176,23 @@ PY
 
 run_arm() {
     local repeat="$1" arm="$2"
-    local policy=LRU dq=0 mode=write_through
-    local out="$run_root/$repeat/$arm" cache="$cache_run/$repeat/$arm"
+    local policy=LRU dq=0 mode=write_through disable_l2=0
+    local out="$run_root/$repeat/$arm" cache=
     local extra=()
     case "$arm" in
         lru) ;;
         lru_writeback) mode=lru_writeback ;;
         bidaw) policy=Bidaw; dq=1; extra+=(--require-answer-policy) ;;
         gandalf) mode=gandalf ;;
+        l1_only) disable_l2=1; mode=l1_only ;;
     esac
-    mkdir -p "$out" "$cache"
+    mkdir -p "$out"
+    if [[ "$disable_l2" == 0 ]]; then
+        cache="$cache_run/$repeat/$arm"
+        mkdir -p "$cache"
+    fi
     printf '\n%s/%s\n' "$repeat" "$arm"
-    EVICTION_POLICY="$policy" BIDAW_DUAL_QUEUE="$dq" L1_GB="$l1_gb" \
+    EVICTION_POLICY="$policy" BIDAW_DUAL_QUEUE="$dq" L1_GB="$l1_gb" DISABLE_L2="$disable_l2" \
         GANDALF_TIER_MODE="$mode" GANDALF_L2_BYTES="$l2_bytes" BIDAW_L2_DIR="$cache" \
         BIDAW_L2_EVENT_LOG="$out/l2_events.jsonl" \
         setsid bash ./start_lmcache_server.sh >"$out/lmcache.log" 2>&1 &
@@ -179,7 +205,7 @@ run_arm() {
     wait_ready http://127.0.0.1:8000/v1/models "$vllm_pid" "$out/vllm.log"
     curl -fsS http://127.0.0.1:8000/metrics >"$out/vllm-metrics-before.txt"
 
-    python3 -m bidaw.trace_replay --users "$users" --speed "$speed" --parallel "$parallel" \
+    python3 -m bidaw.trace_replay --trace-dir "$trace_dir" --users "$users" --speed "$speed" --parallel "$parallel" \
         --seed "$seed" --warmup-seconds 0 --answer-history fixed --track-chunk-fates \
         --label "$arm" --out "$out/replay.json" "${replay_model_args[@]}" "${extra[@]}" | tee "$out/replay.log"
 

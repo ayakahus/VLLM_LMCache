@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from bidaw.gandalf_report import ARMS
+from bidaw.gandalf_report import benchmark_arms
 from bidaw.l2_fate_report import LABELS, classify, latest_run
 
 DEFINITIONS = LABELS
@@ -13,6 +13,7 @@ ARM_LABELS = {
     "lru_writeback": ("LRU write-back", "FCFS · write on L1 eviction"),
     "bidaw": ("Bidaw", "Dual queue · write-through"),
     "gandalf": ("Gandalf", "FCFS · selective write-back"),
+    "l1_only": ("L1-only", "FCFS · DRAM only"),
 }
 SERIES = {
     "A": ("#477eb2", "All later lookups hit DRAM"),
@@ -24,12 +25,12 @@ SERIES = {
 }
 
 
-def summarize(path):
-    marker, events = latest_run(path)
+def summarize(path, *, l1_only=False):
+    marker, events = latest_run(path) if path.is_file() or not l1_only else ({}, [])
     counts = classify(events)
     total_bytes = sum(counts["bytes"].values())
     return {
-        "log": str(path), "run_id": marker["run"], "probe_version": marker["version"],
+        "log": str(path), "run_id": marker.get("run"), "probe_version": marker.get("version"),
         **counts, "physical_write_bytes": total_bytes,
         "write_share": {
             category: counts["classes"][category] / counts["physical_writes"]
@@ -46,9 +47,9 @@ def summarize(path):
 def load_suite(root):
     results = {}
     for repeat in sorted(root.glob("repeat-*")):
-        for arm in ARMS:
+        for arm in benchmark_arms(repeat):
             folder = repeat / arm
-            stats = summarize(folder / "l2_events.jsonl")
+            stats = summarize(folder / "l2_events.jsonl", l1_only=arm == "l1_only")
             status_path = folder / "status-after.json"
             if status_path.is_file():
                 tier = json.loads(status_path.read_text())["tier_policy"]
@@ -82,7 +83,8 @@ def render(results):
 
 
 def pool_arm_counts(results):
-    pooled = {arm: dict.fromkeys(DEFINITIONS, 0) for arm in ARMS}
+    present = {name.rsplit("/", 1)[-1] for name in results}
+    pooled = {arm: dict.fromkeys(DEFINITIONS, 0) for arm in ARM_LABELS if arm in present}
     for name, stats in results.items():
         arm = name.rsplit("/", 1)[-1]
         for category, count in stats["classes"].items():
@@ -100,7 +102,10 @@ def plot_suite(results, output):
         except OSError:
             return ImageFont.load_default(size=size)
 
-    chart = Image.new("RGB", (1500, 668), "#ffffff")
+    pooled = pool_arm_counts(results)
+    grid_bottom = 178 + 80 * len(pooled)
+    legend_y = grid_bottom + 61
+    chart = Image.new("RGB", (1500, legend_y + 109), "#ffffff")
     draw = ImageDraw.Draw(chart)
     title, heading, body, small = font(36, True), font(21, True), font(18), font(16)
     ink, muted = "#172635", "#495968"
@@ -108,7 +113,7 @@ def plot_suite(results, output):
     columns = (*range(1004, 1400, 67), 1442)
 
     draw.text((42, 32), "SSD write outcomes", font=title, fill=ink)
-    repeats = len(results) // len(ARMS)
+    repeats = len({name.split("/", 1)[0] for name in results})
     draw.text((44, 86), f"Share of all confirmed SSD writes · {repeats} "
               f"{'repeat' if repeats == 1 else 'repeats'} per configuration",
               font=body, fill=muted)
@@ -118,10 +123,10 @@ def plot_suite(results, output):
         draw.text((x, 145), name, font=heading, fill=ink, anchor="mt")
     for percent in (0, 25, 50, 75, 100):
         x = x0 + round((x1 - x0) * percent / 100)
-        draw.line((x, 204, x, 498), fill="#e0e5ea")
+        draw.line((x, 204, x, grid_bottom), fill="#e0e5ea")
         draw.text((x, 175), f"{percent}%", font=small, fill=muted, anchor="mt")
 
-    for row, (arm, counts) in enumerate(pool_arm_counts(results).items()):
+    for row, (arm, counts) in enumerate(pooled.items()):
         y = 226 + row * 80
         name, config = ARM_LABELS[arm]
         draw.text((44, y - 1), name, font=heading, fill=ink)
@@ -144,10 +149,10 @@ def plot_suite(results, output):
         if not total:
             draw.text(((x0 + x1) // 2, y + 16), "No SSD writes", font=small, fill=muted, anchor="mm")
 
-    draw.line((44, 559, 1450, 559), fill="#e0e5ea")
+    draw.line((44, legend_y, 1450, legend_y), fill="#e0e5ea")
     for index, (category, (color, label)) in enumerate(SERIES.items()):
         x = 44 + (index % 3) * 480
-        y = 582 + (index // 3) * 42
+        y = legend_y + 23 + (index // 3) * 42
         draw.rounded_rectangle((x, y + 3, x + 21, y + 24), radius=3, fill=color)
         draw.text((x + 30, y), f"{category}  {label}", font=body, fill=ink)
     chart.save(output)
@@ -156,7 +161,7 @@ def plot_suite(results, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path,
-                        help="Four-arm benchmark run directory or one L2 event JSONL file")
+                        help="Benchmark run directory or one L2 event JSONL file")
     parser.add_argument("--out", type=Path, help="Output prefix for reports and the four-arm chart")
     args = parser.parse_args()
     source = args.source

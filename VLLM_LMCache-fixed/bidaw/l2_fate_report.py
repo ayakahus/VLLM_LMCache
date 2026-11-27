@@ -44,13 +44,18 @@ def latest_run(path):
     """Return the marker and events for the most recent probe run."""
     with path.open(encoding="utf-8") as stream:
         marker = None
+        empty = True
         while line := stream.readline():
+            if line.strip():
+                empty = False
             if '"probe_on"' in line:
                 record = json.loads(line)
                 if record.get("ev") == "probe_on":
                     marker = record
                     start = stream.tell()
 
+        if empty:
+            return {}, []
         if marker is None or marker.get("version") not in (3, 4):
             raise ValueError("A version 3 or 4 probe log is required. Record a new run with the updated probe.")
 
@@ -332,16 +337,18 @@ def main():
     marker, events = latest_run(args.log)
     report = {
         "report_version": REPORT_VERSION,
-        "probe_version": marker["version"],
-        "run_id": marker["run"],
+        "probe_version": marker.get("version"),
+        "run_id": marker.get("run"),
         **classify(events),
     }
     total = report["physical_writes"]
     classes = report["classes"]
     per_write = report["attributed_loads_per_write"]
     intensity = f"{per_write:.2f}" if per_write is not None else "n/a"
+    source = (f"Probe v{marker['version']}; report v{REPORT_VERSION}; run {marker['run']}"
+              if marker else f"Empty probe log; report v{REPORT_VERSION}")
     lines = [
-        f"Probe v{report['probe_version']}; report v{report['report_version']}; run {report['run_id']}",
+        source,
         f"Confirmed physical writes: {total}",
         f"Padded-tail writes (included above): {report['padded_tail_writes']}",
         f"Unique L2 locations written: {report['unique']}",
@@ -359,7 +366,7 @@ def main():
         f"Delete events: {report['delete_events']}",
         "",
     ]
-    if marker["version"] < 4:
+    if marker and marker["version"] < 4:
         lines.append("Probe v3 lacks request-level round IDs. Replay with a v4 probe for A and B1–B3.")
     for key, label in LABELS.items():
         percent = classes[key] / total if total else 0
