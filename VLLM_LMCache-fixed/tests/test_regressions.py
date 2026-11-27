@@ -621,8 +621,8 @@ class SchedulerTests(unittest.TestCase):
 
     def test_disk_hrrn_limits_inflight_and_ranks_planned_bytes_before_reserving(self):
         C = self.make_controller(True, l2_concurrency=1); c, other = C(), C()
+        c.submit_prefetch_request(self.spec(100, l2_cells=3))
         c.submit_prefetch_request(self.spec(100, l2_cells=100))
-        c.submit_prefetch_request(self.spec(500, l2_cells=1))
         c.submit_prefetch_request(self.spec(5, l2_cells=0))
         self.assertEqual(other._bidaw_enqueue_monotonic, {})
         c._pending_queue.extend(c._submission_queue)
@@ -631,35 +631,44 @@ class SchedulerTests(unittest.TestCase):
         c._start_pending_requests()
         self.assertEqual(c.started, [1, 2, 3])
         self.assertEqual(c.released, [1, 2, 3])
-        c._bidaw_enqueue_monotonic.update({1:time.monotonic()-.01,2:time.monotonic()-.008})
-        for request in list(c._in_flight_requests.values()):
-            c._advance_request(request, {'lookup': {1}})
-        self.assertEqual(c.loaded, [])
-        self.assertEqual(c.reserved, [])
-        self.assertEqual(c.finished, [3])
         with patch.object(l2_event_probe, '_log') as log:
-            c._start_pending_requests()
+            for request in list(c._in_flight_requests.values()):
+                c._advance_request(request, {'lookup': {1}})
+            self.assertEqual(c.loaded, [1])
+            self.assertEqual(c.reserved, [1])
+            self.assertEqual(c.finished, [3])
             c.submit_prefetch_request(self.spec(500, l2_cells=1))
             c._pending_queue.extend(c._submission_queue)
             c._submission_queue.clear()
             c._start_pending_requests()
-            c._bidaw_enqueue_monotonic[4] = time.monotonic() - .005
+            now = time.monotonic()
+            c._bidaw_enqueue_monotonic.update({2: now - .010, 4: now - .005})
             c._advance_request(c._in_flight_requests[4], {'lookup': {1}})
-            c._start_pending_requests()
-            self.assertEqual(c.reserved, [2])
-            self.assertEqual(set(c._bidaw_disk_ready), {1, 4})
-            for rid in (2, 4, 1):
+            self.assertEqual(c.reserved, [1])
+            self.assertEqual(set(c._bidaw_disk_ready), {2, 4})
+            for rid, dispatched in ((1, [1, 4]), (4, [1, 4, 2]), (2, [1, 4, 2])):
                 request = c._in_flight_requests[rid]
                 request.all_loads_done = lambda: True
                 c._advance_request(request, {'load': {1}})
-                c._start_pending_requests()
-        self.assertEqual(c.loaded, [2, 4, 1])
+                self.assertEqual(c.loaded, dispatched)
         self.assertEqual(c.reserved, c.loaded)
-        self.assertEqual(log.call_args_list[0].args, ('preparing', [{'request': f'{id(c)}:2'}]))
+        self.assertEqual(log.call_args_list[0].args, ('preparing', [{'request': f'{id(c)}:1'}]))
         self.assertEqual(log.call_count, 3)
         self.assertEqual(c._bidaw_disk_ready, {})
         self.assertEqual(c._bidaw_disk_in_flight, set())
         self.assertEqual(c._bidaw_enqueue_monotonic, {})
+
+    def test_disk_concurrency_can_exceed_four(self):
+        c = self.make_controller(True, l2_concurrency=6)()
+        for _ in range(7):
+            c.submit_prefetch_request(self.spec(10, l2_cells=1))
+        c._pending_queue.extend(c._submission_queue)
+        c._submission_queue.clear()
+        c._start_pending_requests()
+        for request in list(c._in_flight_requests.values()):
+            c._advance_request(request, {'lookup': {1}})
+        self.assertEqual(c.reserved, list(range(1, 7)))
+        self.assertEqual(list(c._bidaw_disk_ready), [7])
 
     def test_metadata_admission_skips_head_and_cleanup_releases_waiting_pins(self):
         C = self.make_controller(True); c = C()

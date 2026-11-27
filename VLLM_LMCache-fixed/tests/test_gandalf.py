@@ -1,13 +1,15 @@
 import asyncio
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import tempfile
+from threading import Event, Thread
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from bidaw.gandalf_policy import Block, Decision, History, choose
-from bidaw.gandalf_runtime import Admission, BoundedFS, Settings, _group_kinds, reclaim
+from bidaw.gandalf_policy import Block, Decision, History, choose, plan_evictions
+from bidaw.gandalf_runtime import Admission, BoundedFS, Settings, SourcePins, _group_kinds, reclaim
 
 
 @dataclass(frozen=True)
@@ -65,10 +67,7 @@ class PlacementTests(unittest.TestCase):
             self.history.bind([key])
         dram = {old: 2, new: 1, duplicate: 1}
         disk = {victim: 2, duplicate: 1}
-        parents, _ = self.history.snapshot(dram.keys() | disk.keys())
-        with patch.object(self.history, "snapshot", return_value=(
-            parents, {"old": (10, .5), "new": (1, .5)},
-        )):
+        with patch("bidaw.gandalf_policy._estimate_activity", return_value={"old": (10, .5), "new": (1, .5)}):
             for pinned in ((victim,), ()):
                 with self.subTest(pinned=pinned):
                     decision = self.decision(dram, disk, capacity=3, pinned=pinned,
@@ -81,10 +80,7 @@ class PlacementTests(unittest.TestCase):
         cold_child = Key("cold-child", "cold")
         self.history.bind([cold, cold_child])
         dram = dict.fromkeys((self.root, self.child, cold, cold_child), 1)
-        parents, _ = self.history.snapshot(dram)
-        with patch.object(self.history, "snapshot", return_value=(
-            parents, {"session": (1, .8), "cold": (20, .8)},
-        )):
+        with patch("bidaw.gandalf_policy._estimate_activity", return_value={"session": (1, .8), "cold": (20, .8)}):
             decision = self.decision(dram, {}, fee=.2)
         self.assertEqual((decision.action, decision.key), ("move", cold))
         self.assertAlmostEqual(decision.move_score, .01)
@@ -95,11 +91,8 @@ class PlacementTests(unittest.TestCase):
         cold_leaf = Key("cold-leaf", "cold")
         self.history.bind([cold, cold_leaf])
         dram = dict.fromkeys((self.root, self.child, cold, cold_leaf), 1)
-        parents, _ = self.history.snapshot(dram)
         eligible = {self.root, cold_leaf}
-        with patch.object(self.history, "snapshot", return_value=(
-            parents, {"session": (1, .8), "cold": (20, .2)},
-        )):
+        with patch("bidaw.gandalf_policy._estimate_activity", return_value={"session": (1, .8), "cold": (20, .2)}):
             for fee in (.2, .01):
                 with self.subTest(fee=fee):
                     decision = self.decision(dram, {}, fee=fee, eligible=eligible)
@@ -111,10 +104,7 @@ class PlacementTests(unittest.TestCase):
         duplicate = Key("duplicate", "hot")
         self.history.bind([duplicate])
         dram = dict.fromkeys((self.root, self.child, duplicate), 1)
-        parents, _ = self.history.snapshot(dram)
-        with patch.object(self.history, "snapshot", return_value=(
-            parents, {"session": (20, .2), "hot": (1, .8)},
-        )):
+        with patch("bidaw.gandalf_policy._estimate_activity", return_value={"session": (20, .2), "hot": (1, .8)}):
             decision = self.decision(dram, {duplicate: 1}, fee=1)
             retained_ssd = self.decision(dram, {duplicate: 1}, eligible={duplicate})
         self.assertEqual((decision.action, decision.key), ("drop", self.child))
@@ -137,6 +127,78 @@ class PlacementTests(unittest.TestCase):
         self.history.observe("session", "3")
         self.assertEqual(self.history.clock, 3)
         self.assertEqual(list(self.history.gaps), [2])
+
+
+    def test_activity_snapshot_matches_scan_without_holding_history_lock(self):
+        for i, session in enumerate(("session", "b", "c", "session", "b", "b", "d", "session")):
+            self.history.observe(session, i)
+        clock = self.history.clock
+        ages = {session: max(1, clock - last) for session, last in self.history.last.items()}
+        gaps = tuple(self.history.gaps)
+        observed = Counter(ages.values())
+        expected = {}
+        for session, age in ages.items():
+            limit = age + self.history.horizon
+            returns = sum(age < gap <= limit for gap in gaps)
+            samples = sum(gap > age for gap in gaps)
+            samples += sum(n for idle, n in observed.items() if idle >= limit)
+            expected[session] = (age, (returns + 1) / (samples + 2))
+
+        estimating = Event()
+        changed = Event()
+        from bidaw.gandalf_policy import _estimate_activity
+
+        def estimate(*args):
+            estimating.set()
+            self.assertTrue(changed.wait(2))
+            return _estimate_activity(*args)
+
+        def update():
+            if estimating.wait(2):
+                self.history.observe("new", "new-round")
+                self.history.bind([Key("new", "new")])
+                changed.set()
+
+        updater = Thread(target=update)
+        updater.start()
+        try:
+            with patch("bidaw.gandalf_policy._estimate_activity", side_effect=estimate):
+                snapshot = self.history.eviction_snapshot({self.root, self.child, Key("new", "new")})
+        finally:
+            updater.join(3)
+        self.assertEqual(snapshot.activity, expected)
+        self.assertEqual(snapshot.parents, {self.root: None, self.child: self.root})
+
+    def test_batches_ancestors_before_descendants_without_reusing_ssd_victims(self):
+        victim, leaf = Key("victim", "victim"), Key("leaf", "victim")
+        self.history.bind([victim, leaf])
+        dram = {self.root: 1, self.child: 1}
+        with patch.object(self.history, "eviction_snapshot",
+                          wraps=self.history.eviction_snapshot) as snapshot:
+            results = list(plan_evictions(dram, set(dram), {victim: 1, leaf: 1},
+                                          set(), 2, self.history, 1, lambda _: .01,
+                                          0, 2))
+        self.assertEqual([(d.key, d.action, d.victims) for d in results],
+                         [(self.root, "move", (leaf,)), (self.child, "move", (victim,))])
+        snapshot.assert_called_once()
+
+    def test_idle_history_gc_preserves_ancestors_of_resident_objects(self):
+        history = History(2, idle_window=2)
+        root, child = self.root, self.child
+        gone = Key("gone", "gone")
+        history.observe("session", 1)
+        history.bind([root, child])
+        history.observe("gone", 2)
+        history.bind([gone])
+        for i in range(3, 7):
+            history.observe("busy", i)
+        self.assertTrue(history.gc_due())
+        history.prune({child.cache_salt})
+        self.assertFalse(history.gc_due())
+        self.assertNotIn(gone, history.blocks)
+        self.assertNotIn("gone", history.rounds)
+        self.assertEqual(history.parents[child], root)
+        self.assertIn(root, history.blocks)
 
 
 @dataclass(frozen=True)
@@ -275,6 +337,68 @@ class BoundedFilesystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.budget.status()["used_bytes"], 4)
         self.assertEqual(self.budget.status()["write_bytes"], 6)
         self.assertTrue(await self.adapter._key_exists_on_disk(self.c))
+
+    async def test_in_flight_writes_reserve_quota_and_run_concurrently(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Queue()
+        release = Event()
+        write = self.budget._write_file
+
+        def wait_and_write(key, data):
+            loop.call_soon_threadsafe(started.put_nowait, key)
+            if release.wait(3):
+                write(key, data)
+
+        with patch.object(self.budget, "_write_file", side_effect=wait_and_write):
+            writes = [asyncio.create_task(self.budget.admit(key, b"ab", ()))
+                      for key in (self.a, self.b)]
+            try:
+                running = [await asyncio.wait_for(started.get(), 2) for _ in writes]
+                self.assertCountEqual(running, [self.a, self.b])
+                self.assertEqual(self.budget.status()["inflight_bytes"], 4)
+                self.assertEqual(self.budget.status()["used_bytes"], 0)
+                self.assertEqual(await self.budget.admit(self.c, b"ab", ()),
+                                 (Admission.BLOCKED, 0))
+            finally:
+                release.set()
+                results = await asyncio.gather(*writes)
+        self.assertEqual(results, [(Admission.STORED, 2), (Admission.STORED, 2)])
+        self.assertEqual(self.budget.status()["used_bytes"], 4)
+        self.assertEqual(self.budget.status()["inflight_bytes"], 0)
+        self.assertEqual(self.budget.inflight_keys, {})
+
+    async def test_cancelled_admission_keeps_memoryview_pinned_until_writer_finishes(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = Event()
+        write = self.budget._write_file
+
+        def wait_and_write(key, data):
+            loop.call_soon_threadsafe(started.set)
+            if release.wait(3):
+                write(key, data)
+
+        freed = []
+        memory_manager = SimpleNamespace(free=freed.extend)
+        self.budget.source_pins = SourcePins(memory_manager, "ok")
+        obj = SimpleNamespace(byte_array=bytearray(b"ab"), is_valid=lambda: True)
+        with patch.object(self.budget, "_write_file", side_effect=wait_and_write):
+            task = asyncio.create_task(self.budget.write_object(self.a, obj))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertEqual(memory_manager.free([obj]), "ok")
+                self.assertEqual(freed, [])
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(freed, [obj])
+        self.assertEqual(self.budget.status()["inflight_bytes"], 0)
+        self.assertEqual(self.adapter.writes, [(self.a, 2)])
+        self.assertEqual(self.adapter._key_to_file_and_tmp_path(self.a)[0].read_bytes(), b"ab")
 
     async def test_pinned_victim_blocks_and_io_failure_does_not_count_as_write(self):
         await self.budget.admit(self.a, b"aaaa")

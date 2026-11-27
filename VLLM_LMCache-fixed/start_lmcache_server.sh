@@ -55,8 +55,8 @@ printf '[lmcache] chunk=%s tokens, padded_tail=%s, bidaw_capacity=%s keys, L2=%s
 
 # All arms use the same patches/watermark. Policy and DQ are independent.
 exec python3 -m bidaw.lmcache_server_entry server \
-    --host 0.0.0.0 --port 5555 \
-    --http-host 0.0.0.0 --http-port 8080 \
+    --host 0.0.0.0 --port "$BIDAW_LMCACHE_PORT" \
+    --http-host 0.0.0.0 --http-port "$BIDAW_LMCACHE_HTTP_PORT" \
     --chunk-size "$CHUNK_SIZE" "${GROUP_ARGS[@]}" \
     --l1-size-gb "$L1_GB" \
     --eviction-policy "$EVICTION_POLICY" \

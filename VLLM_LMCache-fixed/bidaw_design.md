@@ -65,7 +65,11 @@ request_configs: dict, 从 sampling_params 提取, 随 STORE op 透传到 Server
 ### 3.2 disk-HRRN
 lookup 完成后按实际 L2 读盘计划的 KV 字节数和请求等待时长计算 HRRN 优先级。
 Preparing Queue 等待期间只保留计划所需的读锁，取得名额后才预留 L1 写缓冲并读盘。
-在途预取请求上限为 `min(4, BIDAW_L2_READ_CONCURRENCY)`，默认 4。
+在途预取请求上限由 `BIDAW_L2_READ_CONCURRENCY` 设置，默认 16。
+已有空闲名额时，lookup 入队和预取完成都会立即触发派发。
+SSD 写盘并行数由 `GANDALF_L2_WRITE_CONCURRENCY` 设置，默认 8。
+多卡并行实验可分别设置 `CUDA_VISIBLE_DEVICES`、`BIDAW_LMCACHE_PORT`、
+`BIDAW_LMCACHE_HTTP_PORT` 和 `VLLM_PORT`。
 
 ### 3.3 文件改动清单
 | 文件 | 类型 | 内容 |

@@ -5,14 +5,16 @@ import json
 import logging
 import os
 import time
-from pathlib import Path
 from importlib.metadata import version
 from textwrap import dedent
 from urllib.request import urlopen
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm.v1.core.sched.scheduler import Scheduler
+
+from bidaw.async_jsonl import TimingLog
 
 logger = logging.getLogger(__name__)
 
@@ -95,21 +97,37 @@ def _compile_arrival_schedule(native, *, dual_queue=True, timing=False):
     return namespace[native.__name__]
 
 
-class TimingLog:
-    """Keep writes from the scheduler and workers separate at record boundaries."""
+class ArrivalQueue(FCFSRequestQueue):
+    """Track insertions that can change FCFS order; removals preserve ordering."""
 
-    def __init__(self, path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    def __init__(self, requests=()):
+        super().__init__(requests)
+        self._dirty = bool(self)
 
-    def write(self, record):
-        try:
-            os.write(self.fd, (json.dumps(record) + "\n").encode())
-        except OSError:
-            logger.exception("Could not write Bidaw timing record")
+    def append(self, request):
+        if self and _arrival_key(request) < _arrival_key(self[-1]):
+            self._dirty = True
+        super().append(request)
 
-    def close(self):
-        os.close(self.fd)
+    def appendleft(self, request):
+        if self and _arrival_key(request) > _arrival_key(self[0]):
+            self._dirty = True
+        super().appendleft(request)
+
+    def extend(self, requests):
+        for request in requests:
+            self.append(request)
+
+    def extendleft(self, requests):
+        super().extendleft(requests)
+        self._dirty = len(self) > 1
+
+    def sort_if_needed(self):
+        if self._dirty and len(self) > 1:
+            ordered = sorted(self, key=_arrival_key)
+            self.clear()
+            super().extend(ordered)
+        self._dirty = False
 
 
 class BidawScheduler(Scheduler):
@@ -132,7 +150,8 @@ class BidawScheduler(Scheduler):
             if dual_queue is None:
                 # The stock MP connector is used when padded tails are disabled.
                 try:
-                    with urlopen("http://127.0.0.1:8080/bidaw/status", timeout=5) as response:
+                    port = os.environ.get("BIDAW_LMCACHE_HTTP_PORT", "8080")
+                    with urlopen(f"http://127.0.0.1:{port}/bidaw/status", timeout=5) as response:
                         dual_queue = json.load(response).get("scheduler", {}).get("enabled")
                 except (OSError, ValueError):
                     logger.warning("Bidaw scheduler status unavailable. Using native vLLM scheduling.")
@@ -143,6 +162,8 @@ class BidawScheduler(Scheduler):
             self._arrival_schedule = _compile_arrival_schedule(
                 Scheduler.schedule, dual_queue=self._dual_queue, timing=bool(self._timing_log))
         if self._dual_queue:
+            self.waiting = ArrivalQueue(self.waiting)
+            self.kv_holding_waiting = ArrivalQueue(self.kv_holding_waiting)
             logger.info("Bidaw GPU admission uses original request arrival order")
 
     def _enqueue_waiting_request(self, request):
@@ -206,11 +227,8 @@ class BidawScheduler(Scheduler):
         # Native skip and promotion paths prepend to their respective queues.
         # Sort both again before selecting across their heads this step.
         if self._dual_queue:
-            for queue in (self.waiting, self.kv_holding_waiting):
-                if len(queue) > 1:
-                    ordered = sorted(queue, key=_arrival_key)
-                    queue.clear()
-                    queue.extend(ordered)
+            self.waiting.sort_if_needed()
+            self.kv_holding_waiting.sort_if_needed()
         return self._arrival_schedule(self, throttle_prefills)
 
 

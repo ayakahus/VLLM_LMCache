@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 # First Party
 from bidaw import padded_tail, policy_registry
-from bidaw.l2_event_probe import record_round, record_shared_replay_end
+from bidaw.l2_event_probe import flush_events, record_round, record_shared_replay_end
 
 router = APIRouter(tags=["bidaw"])
 
@@ -80,4 +80,5 @@ def bidaw_status(request: Request) -> dict[str, Any]:
                     capacity_bytes=0, writes=0, write_bytes=0, reads=0)
     if tier is not None:
         status["tier_policy"] = tier
+    flush_events()
     return status

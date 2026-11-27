@@ -55,14 +55,16 @@ if [[ $# != 0 || ${#arms[@]} == 0 || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 source ./env.sh
-python3 - "$users" "$speed" "$parallel" "$l1_gb" "$l2_bytes" "$model_dir" "$with_l2" <<'PY'
+vllm_url="http://127.0.0.1:$VLLM_PORT"
+lmc_url="http://127.0.0.1:$BIDAW_LMCACHE_HTTP_PORT"
+python3 - "$users" "$speed" "$parallel" "$l1_gb" "$l2_bytes" "$model_dir" "$with_l2" "$BIDAW_LMCACHE_PORT" "$BIDAW_LMCACHE_HTTP_PORT" "$VLLM_PORT" <<'PY'
 import math
 import socket
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import sys
 
-users, speed, parallel, dram, ssd, model, with_l2 = sys.argv[1:]
+users, speed, parallel, dram, ssd, model, with_l2, *ports = sys.argv[1:]
 if (min(int(users), int(parallel)) <= 0 or min(float(speed), float(dram)) <= 0
         or not all(math.isfinite(float(x)) for x in (speed, dram))
         or (with_l2 == "1" and int(ssd) < 7340032)):
@@ -80,7 +82,10 @@ if torch.cuda.device_count() != 1:
     sys.exit("Select one available GPU using CUDA_VISIBLE_DEVICES.")
 if not (Path(model) / "config.json").is_file():
     sys.exit(f"The local model is required: {model}")
-for port in (5555, 8080, 8000):
+ports = tuple(map(int, ports))
+if len(set(ports)) != 3 or any(not 1 <= port <= 65535 for port in ports):
+    sys.exit("Benchmark ports must be distinct and in 1..65535.")
+for port in ports:
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -137,7 +142,7 @@ wait_ready() {
 }
 
 wait_for_writes() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "$lmc_url" <<'PY'
 import json
 from pathlib import Path
 import re
@@ -146,13 +151,14 @@ import time
 from urllib.request import urlopen
 
 out = Path(sys.argv[1])
+lmc_url = sys.argv[2]
 last = None
 quiet_since = time.monotonic()
 deadline = quiet_since + 120
 while time.monotonic() < deadline:
-    with urlopen("http://127.0.0.1:8080/bidaw/status", timeout=5) as response:
+    with urlopen(lmc_url + "/bidaw/status", timeout=5) as response:
         state = json.load(response)
-    with urlopen("http://127.0.0.1:8080/metrics", timeout=5) as response:
+    with urlopen(lmc_url + "/metrics", timeout=5) as response:
         metrics = response.read().decode()
     staging = re.findall(r"^lmcache_mp_l1_staging_bytes(?:\{[^}]*\})?\s+(\S+)", metrics, re.M)
     tier = state["tier_policy"]
@@ -160,7 +166,7 @@ while time.monotonic() < deadline:
         "writes", "migrations", "reused_ssd_copies", "drops", "failed_migrations",
         "failed_writes", "blocked_migrations", "eviction_failures",
     ))
-    busy = (any(tier.get(k, 0) for k in ("pending_keys", "in_flight_stores", "active_evictions"))
+    busy = (any(tier.get(k, 0) for k in ("pending_keys", "in_flight_stores", "active_evictions", "inflight_bytes"))
             or any(float(value) for value in staging))
     if busy or last != counters:
         quiet_since = time.monotonic()
@@ -197,20 +203,20 @@ run_arm() {
         BIDAW_L2_EVENT_LOG="$out/l2_events.jsonl" \
         setsid bash ./start_lmcache_server.sh >"$out/lmcache.log" 2>&1 &
     lmcache_pid=$!
-    wait_ready http://127.0.0.1:8080/healthcheck "$lmcache_pid" "$out/lmcache.log"
-    curl -fsS http://127.0.0.1:8080/bidaw/status >"$out/status-before.json"
+    wait_ready "$lmc_url/healthcheck" "$lmcache_pid" "$out/lmcache.log"
+    curl -fsS "$lmc_url/bidaw/status" >"$out/status-before.json"
 
     BIDAW_VLLM_TIMING_LOG="$out/vllm_timing.jsonl" setsid bash ./start_vllm.sh >"$out/vllm.log" 2>&1 &
     vllm_pid=$!
-    wait_ready http://127.0.0.1:8000/v1/models "$vllm_pid" "$out/vllm.log"
-    curl -fsS http://127.0.0.1:8000/metrics >"$out/vllm-metrics-before.txt"
+    wait_ready "$vllm_url/v1/models" "$vllm_pid" "$out/vllm.log"
+    curl -fsS "$vllm_url/metrics" >"$out/vllm-metrics-before.txt"
 
-    python3 -m bidaw.trace_replay --trace-dir "$trace_dir" --users "$users" --speed "$speed" --parallel "$parallel" \
+    python3 -m bidaw.trace_replay --vllm "$vllm_url" --lmc "$lmc_url" --trace-dir "$trace_dir" --users "$users" --speed "$speed" --parallel "$parallel" \
         --seed "$seed" --warmup-seconds 0 --answer-history fixed --track-chunk-fates \
         --label "$arm" --out "$out/replay.json" "${replay_model_args[@]}" "${extra[@]}" | tee "$out/replay.log"
 
     wait_for_writes "$out/status-after.json"
-    curl -fsS http://127.0.0.1:8000/metrics >"$out/vllm-metrics-after.txt"
+    curl -fsS "$vllm_url/metrics" >"$out/vllm-metrics-after.txt"
     cleanup
 }
 

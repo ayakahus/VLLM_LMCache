@@ -51,12 +51,11 @@ def apply_dual_queue_patch():
     disk_limit = 4
     if enabled:
         try:
-            l2_concurrency = int(os.environ.get('BIDAW_L2_READ_CONCURRENCY', '4'))
+            disk_limit = int(os.environ.get('BIDAW_L2_READ_CONCURRENCY', '16'))
         except ValueError as exc:
             raise ValueError('BIDAW_L2_READ_CONCURRENCY must be a positive integer') from exc
-        if l2_concurrency < 1:
+        if disk_limit < 1:
             raise ValueError('BIDAW_L2_READ_CONCURRENCY must be a positive integer')
-        disk_limit = min(disk_limit, l2_concurrency)
     STATS.enabled = enabled
     original_init = cls.__init__
     original_submit = cls.submit_prefetch_request
@@ -70,6 +69,7 @@ def apply_dual_queue_patch():
         self._bidaw_waiting_locks = {}
         self._bidaw_disk_ready = {}
         self._bidaw_disk_in_flight = set()
+        self._bidaw_dispatching = False
         original_init(self, *args, **kwargs)
 
     def submit(self, spec):
@@ -161,7 +161,8 @@ def apply_dual_queue_patch():
             if self._is_l2_eligible(request, index)
         }
         # Keep only the native plan's read locks while waiting for a disk slot.
-        # _transition_to_load_phase revalidates the plan before reserving L1.
+        # Native _plan_load only prunes held locks. The transition revalidates
+        # those locks before allocation without acquiring them a second time.
         self._plan_load(request, active_l2_descs)
         row_sizes = [
             pc.get_size_bytes(group.layout_desc.shapes, group.layout_desc.dtypes)
@@ -174,6 +175,7 @@ def apply_dual_queue_patch():
         )
         if size_bytes:
             self._bidaw_disk_ready[request.request_id] = request, size_bytes
+            dispatch_disk(self)
         else:
             self._finish_request(request)
             self._retire_request(request)
@@ -195,43 +197,53 @@ def apply_dual_queue_patch():
         in_flight = self._bidaw_disk_in_flight
         if not ready or len(in_flight) >= disk_limit:
             return
-        now = time.monotonic()
-        with self._submission_lock:
-            arrival = {rid: self._bidaw_enqueue_monotonic[rid] for rid in ready}
-        ordered = sorted(ready, key=lambda rid: (
-            -(now - arrival[rid]) / ready[rid][1], arrival[rid], rid
-        ))
-        for rid in ordered:
-            if len(in_flight) >= disk_limit:
-                break
-            reordered = rid != next(iter(ready))
-            request, size_bytes = ready.pop(rid)
-            wait = now - arrival[rid]
-            in_flight.add(rid)
-            try:
-                record_preparing_dispatch(self, rid)
-                self._transition_to_load_phase(request)
-                if request.all_loads_done():
-                    self._finish_request(request)
-                    self._retire_request(request)
-            except Exception:
-                pc.logger.exception('Failed dispatching prefetch request %d', rid)
-                self._abort_request(request)
-                continue
-            with STATS._lock:
-                STATS.dispatches += 1
-                STATS.reordered_dispatches += int(reordered)
-                STATS.max_wait_s = max(STATS.max_wait_s, wait)
-                STATS.last_dispatch_ratio = 1.0 + wait / size_bytes
-                STATS.last_dispatch_bytes = size_bytes
+        if self._bidaw_dispatching or self._stop_flag.is_set():
+            return
+        self._bidaw_dispatching = True
+        try:
+            now = time.monotonic()
+            with self._submission_lock:
+                arrival = {rid: self._bidaw_enqueue_monotonic[rid] for rid in ready}
+            ordered = sorted(ready, key=lambda rid: (
+                -(now - arrival[rid]) / ready[rid][1], arrival[rid], rid
+            ))
+            for rid in ordered:
+                if len(in_flight) >= disk_limit:
+                    break
+                reordered = rid != next(iter(ready))
+                request, size_bytes = ready.pop(rid)
+                wait = now - arrival[rid]
+                in_flight.add(rid)
+                try:
+                    record_preparing_dispatch(self, rid)
+                    self._transition_to_load_phase(request)
+                    if request.all_loads_done():
+                        self._finish_request(request)
+                        self._retire_request(request)
+                except Exception:
+                    pc.logger.exception('Failed dispatching prefetch request %d', rid)
+                    self._abort_request(request)
+                    continue
+                with STATS._lock:
+                    STATS.dispatches += 1
+                    STATS.reordered_dispatches += int(reordered)
+                    STATS.max_wait_s = max(STATS.max_wait_s, wait)
+                    STATS.last_dispatch_ratio = 1.0 + wait / size_bytes
+                    STATS.last_dispatch_bytes = size_bytes
+        finally:
+            self._bidaw_dispatching = False
 
     def retire(self, request):
         rid = request.request_id
         self._bidaw_disk_ready.pop(rid, None)
+        released = rid in self._bidaw_disk_in_flight
         self._bidaw_disk_in_flight.discard(rid)
         with self._submission_lock:
             self._bidaw_enqueue_monotonic.pop(rid, None)
-        return original_retire(self, request)
+        result = original_retire(self, request)
+        if released:
+            dispatch_disk(self)
+        return result
 
     def cleanup(self):
         try:

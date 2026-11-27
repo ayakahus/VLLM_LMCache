@@ -18,6 +18,7 @@ the server boots:
 
 # Standard
 from functools import wraps
+from contextlib import asynccontextmanager
 import os
 
 # First Party
@@ -70,9 +71,21 @@ def _patch_http() -> None:
     from lmcache.v1.multiprocess import http_server as hs
 
     from bidaw.api import router
+    from bidaw.l2_event_probe import close_events
 
     if not any(getattr(r, "path", "").startswith("/bidaw") for r in hs.app.routes):
         hs.app.include_router(router)
+        lifespan = hs.app.router.lifespan_context
+
+        @asynccontextmanager
+        async def bidaw_lifespan(app):
+            try:
+                async with lifespan(app) as state:
+                    yield state
+            finally:
+                close_events()
+
+        hs.app.router.lifespan_context = bidaw_lifespan
 
 
 def _patch_conversation_lookup() -> None:

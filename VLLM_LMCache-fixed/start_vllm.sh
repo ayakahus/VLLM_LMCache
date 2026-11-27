@@ -55,6 +55,7 @@ if [[ "${VLLM_WITHOUT_LMCACHE:-0}" != "1" ]]; then
     if [[ -n "${BIDAW_VLLM_TIMING_LOG:-}" && "$CONNECTOR_CONFIG" != *BidawPaddedTailConnector* ]]; then
         CONNECTOR_CONFIG='{"kv_connector_module_path":"bidaw.vllm_timing_connector",'"${CONNECTOR_CONFIG:1}"
     fi
+    CONNECTOR_CONFIG=${CONNECTOR_CONFIG//:5555/:$BIDAW_LMCACHE_PORT}
     KV_ARGS=(--kv-transfer-config "$CONNECTOR_CONFIG"
              --scheduler-cls bidaw.vllm_arrival_scheduler.BidawScheduler)
 fi

@@ -169,6 +169,8 @@ class BidawEvictionPolicy(EvictionPolicy):
 
             selected: list[ObjectKey] = []
             for _grace, _potential, _last_touch, keys in scored:
+                # Touch order does not identify prefix leaves. Evicting a
+                # partial session could leave an unreachable suffix.
                 selected.extend(keys)
                 if len(selected) >= target:
                     break

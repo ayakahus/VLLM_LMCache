@@ -6,7 +6,7 @@ import time
 from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector as NativeConnector
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
-from bidaw.vllm_arrival_scheduler import TimingLog
+from bidaw.async_jsonl import TimingLog
 
 
 class LMCacheMPConnector(NativeConnector):
@@ -30,7 +30,7 @@ class LMCacheMPConnector(NativeConnector):
         return result
 
     def get_finished(self, finished_req_ids):
-        if self._timing_log is None:
+        if getattr(self, "_timing_log", None) is None:
             return super().get_finished(finished_req_ids)
         healthy = self.worker_adapter.is_healthy
         result = super().get_finished(finished_req_ids)

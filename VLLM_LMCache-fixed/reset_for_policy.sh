@@ -23,9 +23,9 @@ EVICTION_POLICY="$POLICY" BIDAW_DUAL_QUEUE="$DQ" L1_GB="${L1_GB:-1}" \
 disown
 sleep 8
 for i in $(seq 1 20); do
-    curl -sf http://127.0.0.1:8080/healthcheck >/dev/null && break
+    curl -sf "http://127.0.0.1:${BIDAW_LMCACHE_HTTP_PORT:-8080}/healthcheck" >/dev/null && break
     sleep 2
 done
-curl -fsS http://127.0.0.1:8080/healthcheck >/dev/null
+curl -fsS "http://127.0.0.1:${BIDAW_LMCACHE_HTTP_PORT:-8080}/healthcheck" >/dev/null
 echo "server[$POLICY] healthy"
 ./restart_vllm.sh

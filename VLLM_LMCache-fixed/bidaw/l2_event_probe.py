@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 """Log confirmed lifecycle and queue events for LMCache 0.5.7.post1."""
-import json
 import logging
 import os
 import threading
@@ -8,14 +7,16 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
-from pathlib import Path
 from uuid import uuid4
 
+from bidaw.async_jsonl import TimingLog
 from bidaw.padded_tail import TAIL_VALID_TOKENS
 
 _log = None
+_writer = None
 _logger = logging.getLogger(__name__)
 _l1_cycle = ContextVar("bidaw_l1_cycle", default=None)
+_cycle_lock = threading.Lock()
 
 
 def l1_cycle_active():
@@ -25,7 +26,21 @@ def l1_cycle_active():
 def record_l1_cycle_phase(field, duration_ms):
     cycle = _l1_cycle.get()
     if cycle is not None:
-        cycle[field] = cycle.get(field, 0.0) + duration_ms
+        with _cycle_lock:
+            cycle[field] = cycle.get(field, 0.0) + duration_ms
+
+
+def flush_events():
+    if _writer is not None:
+        _writer.flush()
+
+
+def close_events():
+    global _log, _writer
+    _log = None
+    if _writer is not None:
+        _writer.close()
+        _writer = None
 
 
 @dataclass
@@ -219,7 +234,7 @@ def _key_fields(key):
 
 
 def apply_l2_event_probe(*, l1_only: bool = False) -> bool:
-    global _log
+    global _log, _writer
     out = os.environ.get("BIDAW_L2_EVENT_LOG")
     if not out:
         return False
@@ -233,10 +248,7 @@ def apply_l2_event_probe(*, l1_only: bool = False) -> bool:
         prefetch_controller as pc,
     )
 
-    path = Path(out)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stream = path.open("a", encoding="utf-8")
-    lock = threading.Lock()
+    writer = TimingLog(out)
     run = uuid4().hex
     load_request = ContextVar("bidaw_load_request", default={})
     load_task = ContextVar("bidaw_load_task", default=None)
@@ -246,12 +258,9 @@ def apply_l2_event_probe(*, l1_only: bool = False) -> bool:
     def log(event, records, timestamp=None):
         if timestamp is None:
             timestamp = time.monotonic_ns()
-        lines = [json.dumps({"run": run, "t_ns": timestamp, "ev": event, **fields}) + "\n"
-                 for fields in records]
-        if lines:
-            with lock:
-                stream.writelines(lines)
-                stream.flush()
+        prefix = (("run", run), ("t_ns", timestamp), ("ev", event))
+        for fields in records:
+            writer.write_fields(prefix + tuple(fields.items()))
 
     def log_keys(event, keys, extras, timestamp=None):
         log(event, ({**_key_fields(key), **extras} for key in keys), timestamp)
@@ -411,5 +420,6 @@ def apply_l2_event_probe(*, l1_only: bool = False) -> bool:
     ec.L1EvictionController.execute_eviction_action = l1_action
     BaseL1Manager._free_and_report_deleted = l1_removed
     _install_transfer_timing(log, StorageManager)
+    _writer = writer
     _log = log
     return True

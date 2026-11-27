@@ -1,5 +1,6 @@
 """Finish-time padded STORE for the pinned vLLM and LMCache MP connector."""
 import json
+import os
 from importlib.metadata import version
 from urllib.request import urlopen
 from uuid import uuid4
@@ -27,7 +28,8 @@ class BidawPaddedTailConnector(LMCacheMPConnector):
         if vllm_config.speculative_config is not None:
             raise ValueError("Padded tails require vLLM without speculative decoding")
         if role == KVConnectorRole.SCHEDULER:
-            with urlopen("http://127.0.0.1:8080/bidaw/status", timeout=5) as response:
+            port = os.environ.get("BIDAW_LMCACHE_HTTP_PORT", "8080")
+            with urlopen(f"http://127.0.0.1:{port}/bidaw/status", timeout=5) as response:
                 server_status = json.load(response)
             if server_status.get("padded_tail_store") is not True:
                 raise RuntimeError("Start the LMCache server with BIDAW_PAD_TAIL=1")
