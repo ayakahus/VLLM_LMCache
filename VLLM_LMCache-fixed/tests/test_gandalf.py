@@ -333,6 +333,14 @@ class FakeAdapter:
         self._lock = Lock()
         self._completed_load_tasks = {}
         self._load_efd = Mock()
+        self._completed_lookup_tasks = {}
+        self._lookup_efd = Mock()
+        self._next_task_id = 0
+
+    def _get_next_task_id(self):
+        task_id = self._next_task_id
+        self._next_task_id += 1
+        return task_id
 
     def _key_to_file_and_tmp_path(self, key):
         return self.directory / key.name, self.directory / (key.name + ".tmp")
@@ -374,6 +382,84 @@ class BoundedFilesystemTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.budget._write_executor.shutdown)
         self.addCleanup(self.budget._read_executor.shutdown)
         self.a, self.b, self.c = Key("a"), Key("b"), Key("c")
+
+    async def lookup_indices(self, keys):
+        from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2Adapter
+
+        task_id = await asyncio.wait_for(asyncio.to_thread(self.budget.submit_lookup, keys), 2)
+        result = FSL2Adapter.query_lookup_and_lock_result(self.adapter, task_id)
+        self.assertIsNone(FSL2Adapter.query_lookup_and_lock_result(self.adapter, task_id))
+        return result.get_indices_list()
+
+    async def test_lookup_observes_only_committed_files_outside_in_progress_unlinks(self):
+        await self.budget.admit(self.b, b"bb")
+        loop = asyncio.get_running_loop()
+        file_written = asyncio.Event()
+        finish_write = Event()
+        write = self.budget._write_file
+
+        def write_then_pause(key, data):
+            write(key, data)
+            loop.call_soon_threadsafe(file_written.set)
+            if not finish_write.wait(5):
+                raise TimeoutError("test did not release writer")
+
+        with patch.object(self.budget, "_write_file", side_effect=write_then_pause):
+            store = asyncio.create_task(self.budget.admit(self.a, b"aa"))
+            try:
+                await asyncio.wait_for(file_written.wait(), 2)
+                self.assertTrue(await self.adapter._key_exists_on_disk(self.a))
+                self.assertEqual(await self.lookup_indices([self.a, self.b, self.c]), [1])
+            finally:
+                finish_write.set()
+                self.assertEqual(await asyncio.wait_for(store, 2), (Admission.STORED, 2))
+
+        self.assertEqual(await self.lookup_indices([self.a, self.b, self.c]), [0, 1])
+        unlink_started = asyncio.Event()
+        finish_unlink = asyncio.Event()
+
+        async def unlink(adapter, keys):
+            self.assertEqual(keys, [self.a])
+            self.assertTrue(self.budget.io_lock.locked())
+            unlink_started.set()
+            await finish_unlink.wait()
+            return await FakeAdapter.delete_files(adapter, keys)
+
+        # Lookup does not pin either file. The real read pin on b must survive
+        # lookup/unlock and protect b from the same delete action.
+        from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2Adapter
+
+        await self.budget.pin_load([self.b])
+        with patch.object(self.budget, "delete_files", side_effect=unlink):
+            deletion = asyncio.create_task(self.budget.delete([self.a, self.b]))
+            try:
+                await asyncio.wait_for(unlink_started.wait(), 2)
+                self.assertTrue(await self.adapter._key_exists_on_disk(self.a))
+                self.assertEqual(await self.lookup_indices([self.a, self.b, self.c]), [1])
+                FSL2Adapter.submit_unlock(self.adapter, [self.b])
+                self.assertEqual(self.budget.readers, {self.b: 1})
+            finally:
+                finish_unlink.set()
+                self.assertEqual(await asyncio.wait_for(deletion, 2), ([self.a], [2]))
+                self.budget.unpin_load([self.b])
+        self.assertEqual(await self.lookup_indices([self.a, self.b, self.c]), [1])
+        self.assertEqual(self.adapter._lookup_efd.notify.call_count, 4)
+        self.assertFalse(self.budget.readers)
+        self.assertFalse(self.budget._removing)
+
+    async def test_lookup_recovers_after_failed_unlink_without_leaking_readers(self):
+        await self.budget.admit(self.a, b"aa")
+
+        async def failed_unlink(adapter, keys):
+            self.assertEqual(await self.lookup_indices(keys), [])
+            raise OSError(errno.EIO, "test unlink failure")
+
+        with patch.object(self.budget, "delete_files", side_effect=failed_unlink):
+            with self.assertRaises(OSError):
+                await self.budget.delete([self.a])
+        self.assertEqual(await self.lookup_indices([self.a]), [0])
+        self.assertFalse(self.budget.readers)
+        self.assertFalse(self.budget._removing)
 
     async def test_batch_reads_concurrently_and_reports_partial_success_in_input_order(self):
         missing, failed, short = (Key(name) for name in ("missing", "failed", "short"))

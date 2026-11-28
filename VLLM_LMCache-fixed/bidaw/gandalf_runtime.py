@@ -270,6 +270,25 @@ class BoundedFS:
                 if key in self.residents:
                     self.residents.move_to_end(key)
 
+    def submit_lookup(self, keys):
+        from lmcache.lmcache_native import Bitmap
+
+        bitmap = Bitmap(len(keys))
+        with self.lock:
+            # The dedicated local adapter owns every file. A write becomes
+            # visible at resident commit, and unlink marks it before touching disk.
+            for index, key in enumerate(keys):
+                if key in self.residents and key not in self._removing:
+                    bitmap.set(index)
+
+        # Keep native FS's advisory lookup: submit_unlock is a no-op,
+        # and only actual reads pin files against deletion.
+        with self.adapter._lock:
+            task_id = self.adapter._get_next_task_id()
+            self.adapter._completed_lookup_tasks[task_id] = bitmap
+        self.adapter._lookup_efd.notify()
+        return task_id
+
     async def pin_load(self, keys):
         probe = active_load.get()
         while True:
@@ -822,6 +841,9 @@ def apply_tiering():
     async def execute_delete(self, keys):
         return await self._gandalf_budget.delete(keys)
 
+    def submit_lookup_and_lock_task(self, keys, group_layout_descs):
+        return self._gandalf_budget.submit_lookup(keys)
+
     async def execute_load(self, keys, objects, task_id):
         return await self._gandalf_budget.execute_load(keys, objects, task_id)
 
@@ -875,6 +897,7 @@ def apply_tiering():
     FSL2Adapter.close = close_fs
     FSL2Adapter._execute_store = execute_store
     FSL2Adapter._execute_delete = execute_delete
+    FSL2Adapter.submit_lookup_and_lock_task = submit_lookup_and_lock_task
     FSL2Adapter._execute_load = execute_load
     FSL2Adapter._notify_keys_accessed = touch
     StorageManager.__init__ = init_manager
