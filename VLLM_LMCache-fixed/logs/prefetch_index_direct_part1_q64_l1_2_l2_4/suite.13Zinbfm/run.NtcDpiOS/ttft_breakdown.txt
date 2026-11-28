@@ -1,0 +1,138 @@
+## TTFT critical path (ms)
+
+| Arm | Metric | Samples | mean | p50 | p90 | p95 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| lru | Client TTFT | 5950 | 509.426 | 372.348 | 1008.775 | 1292.236 | 1990.335 |
+| lru | Server TTFT | 5950 | 460.964 | 354.023 | 978.278 | 1676.115 | 2339.684 |
+| lru | vLLM prefill | 5950 | 93.342 | 150.278 | 270.500 | 285.528 | 297.550 |
+| lru | LMCache lookup | 6038 | 170.726 | 89.561 | 439.429 | 639.684 | 1585.152 |
+| lru | SSD load task wall | 1814 | 32.873 | 24.288 | 70.322 | 87.634 | 117.231 |
+| lru | SSD object pure I/O | 5192 | 10.117 | 7.356 | 19.748 | 24.996 | 39.280 |
+| lru | SSD object queue + resume | 5192 | 24.435 | 18.551 | 54.797 | 67.428 | 91.382 |
+| lru | SSD object read (submit → done) | 5192 | 34.553 | 28.250 | 68.861 | 83.789 | 109.001 |
+| lru | Legacy SSD task wall (object-weighted) | n/a | n/a | n/a | n/a | n/a | n/a |
+| lru | SSD read time per request | 5950 | 10.029 | 0.000 | 38.438 | 57.665 | 96.782 |
+| lru | Lookup → SSD load attempt | 1814 | 13.851 | 8.592 | 26.305 | 38.814 | 80.236 |
+| lru | SSD load wait for conflicting delete | 1814 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| lru | LMCache prefetch lookup → hit | 3054 | 36.218 | 20.114 | 91.835 | 112.188 | 158.325 |
+| lru | DRAM → GPU RETRIEVE | 3054 | 31.066 | 21.248 | 70.514 | 107.650 | 128.092 |
+| lru | GPU scheduling queue | 5950 | 71.338 | 1.750 | 231.698 | 461.871 | 948.111 |
+| lru | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a | n/a |
+| lru | vLLM queue (raw) | 5950 | 337.816 | 247.917 | 785.867 | 1082.992 | 1753.676 |
+| lru_writeback | Client TTFT | 5950 | 562.942 | 453.082 | 1090.974 | 1306.182 | 1894.624 |
+| lru_writeback | Server TTFT | 5950 | 511.261 | 415.701 | 1194.978 | 1854.136 | 2381.462 |
+| lru_writeback | vLLM prefill | 5950 | 94.758 | 150.404 | 270.728 | 285.768 | 297.801 |
+| lru_writeback | LMCache lookup | 6058 | 200.921 | 129.573 | 486.229 | 678.026 | 1443.372 |
+| lru_writeback | SSD load task wall | 1209 | 38.026 | 29.723 | 60.652 | 78.446 | 249.572 |
+| lru_writeback | SSD object pure I/O | 2953 | 11.480 | 7.091 | 19.124 | 25.968 | 101.657 |
+| lru_writeback | SSD object queue + resume | 2953 | 21.246 | 17.909 | 38.783 | 46.226 | 75.222 |
+| lru_writeback | SSD object read (submit → done) | 2953 | 32.726 | 27.200 | 51.643 | 62.360 | 185.829 |
+| lru_writeback | Legacy SSD task wall (object-weighted) | n/a | n/a | n/a | n/a | n/a | n/a |
+| lru_writeback | SSD read time per request | 5950 | 7.732 | 0.000 | 30.228 | 44.633 | 78.906 |
+| lru_writeback | Lookup → SSD load attempt | 1209 | 38.738 | 15.167 | 111.958 | 184.942 | 295.218 |
+| lru_writeback | SSD load wait for conflicting delete | 1209 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| lru_writeback | LMCache prefetch lookup → hit | 3122 | 41.688 | 14.422 | 100.673 | 160.263 | 307.265 |
+| lru_writeback | DRAM → GPU RETRIEVE | 3122 | 38.505 | 26.162 | 94.002 | 109.777 | 124.948 |
+| lru_writeback | GPU scheduling queue | 5950 | 69.059 | 1.783 | 262.144 | 440.184 | 807.754 |
+| lru_writeback | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a | n/a |
+| lru_writeback | vLLM queue (raw) | 5950 | 386.271 | 287.255 | 877.604 | 1112.816 | 1686.508 |
+| bidaw | Client TTFT | 5950 | 539.569 | 416.858 | 1072.453 | 1282.716 | 1887.276 |
+| bidaw | Server TTFT | 5950 | 493.070 | 392.119 | 1124.413 | 1822.770 | 2381.455 |
+| bidaw | vLLM prefill | 5950 | 91.168 | 150.202 | 270.364 | 285.384 | 297.400 |
+| bidaw | LMCache lookup | 6802 | 166.839 | 92.181 | 464.150 | 632.107 | 1174.935 |
+| bidaw | SSD load task wall | 1844 | 32.930 | 24.308 | 65.067 | 81.056 | 137.543 |
+| bidaw | SSD object pure I/O | 5331 | 10.652 | 7.677 | 18.845 | 24.363 | 43.652 |
+| bidaw | SSD object queue + resume | 5331 | 20.499 | 12.302 | 44.564 | 61.585 | 97.694 |
+| bidaw | SSD object read (submit → done) | 5331 | 31.151 | 21.882 | 62.118 | 79.377 | 131.580 |
+| bidaw | Legacy SSD task wall (object-weighted) | n/a | n/a | n/a | n/a | n/a | n/a |
+| bidaw | SSD read time per request | 5950 | 10.213 | 0.000 | 33.944 | 52.078 | 93.761 |
+| bidaw | Lookup → SSD load attempt | 1844 | 19.177 | 11.143 | 38.574 | 69.209 | 149.704 |
+| bidaw | SSD load wait for conflicting delete | 1844 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| bidaw | LMCache prefetch lookup → hit | 3141 | 36.390 | 22.602 | 91.177 | 123.019 | 220.516 |
+| bidaw | DRAM → GPU RETRIEVE | 3141 | 34.234 | 23.160 | 82.046 | 108.180 | 130.138 |
+| bidaw | GPU scheduling queue | 5950 | 72.856 | 1.742 | 268.037 | 435.200 | 886.445 |
+| bidaw | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a | n/a |
+| bidaw | vLLM queue (raw) | 5950 | 373.063 | 268.018 | 884.974 | 1128.401 | 1683.962 |
+| gandalf | Client TTFT | 5950 | 710.487 | 591.511 | 1452.323 | 1632.111 | 2056.469 |
+| gandalf | Server TTFT | 5950 | 668.046 | 558.243 | 1993.552 | 2255.129 | 2464.390 |
+| gandalf | vLLM prefill | 5950 | 93.047 | 150.177 | 270.318 | 285.336 | 297.350 |
+| gandalf | LMCache lookup | 6022 | 270.090 | 178.256 | 678.205 | 889.155 | 2057.206 |
+| gandalf | SSD load task wall | 778 | 24.812 | 19.130 | 47.330 | 61.023 | 87.371 |
+| gandalf | SSD object pure I/O | 1169 | 9.542 | 6.744 | 18.571 | 25.350 | 42.653 |
+| gandalf | SSD object queue + resume | 1169 | 14.464 | 10.439 | 31.511 | 41.474 | 61.901 |
+| gandalf | SSD object read (submit → done) | 1169 | 24.006 | 19.014 | 45.931 | 56.477 | 83.430 |
+| gandalf | Legacy SSD task wall (object-weighted) | n/a | n/a | n/a | n/a | n/a | n/a |
+| gandalf | SSD read time per request | 5950 | 3.248 | 0.000 | 11.520 | 24.550 | 51.404 |
+| gandalf | Lookup → SSD load attempt | 778 | 34.525 | 14.998 | 86.580 | 128.537 | 306.376 |
+| gandalf | SSD load wait for conflicting delete | 778 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| gandalf | LMCache prefetch lookup → hit | 3694 | 35.994 | 15.036 | 92.757 | 129.647 | 234.858 |
+| gandalf | DRAM → GPU RETRIEVE | 3694 | 33.730 | 22.034 | 77.660 | 104.586 | 124.596 |
+| gandalf | GPU scheduling queue | 5950 | 65.475 | 1.661 | 220.719 | 402.790 | 965.680 |
+| gandalf | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a | n/a |
+| gandalf | vLLM queue (raw) | 5950 | 548.128 | 436.189 | 1289.252 | 1445.996 | 1926.101 |
+| l1_only | Client TTFT | 5950 | 506.172 | 384.450 | 1059.248 | 1241.645 | 1554.034 |
+| l1_only | Server TTFT | 5950 | 457.661 | 353.780 | 1107.644 | 1803.822 | 2360.764 |
+| l1_only | vLLM prefill | 5950 | 118.323 | 150.709 | 271.277 | 286.348 | 298.404 |
+| l1_only | LMCache lookup | 6074 | 164.889 | 78.669 | 465.130 | 650.537 | 978.347 |
+| l1_only | SSD load task wall | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | SSD object pure I/O | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | SSD object queue + resume | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | SSD object read (submit → done) | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | Legacy SSD task wall (object-weighted) | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | SSD read time per request | 5950 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| l1_only | Lookup → SSD load attempt | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | SSD load wait for conflicting delete | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | LMCache prefetch lookup → hit | 1213 | 0.716 | 0.674 | 0.864 | 0.895 | 1.406 |
+| l1_only | DRAM → GPU RETRIEVE | 1213 | 54.177 | 30.732 | 118.922 | 125.515 | 134.151 |
+| l1_only | GPU scheduling queue | 5950 | 103.946 | 2.742 | 367.779 | 559.785 | 915.866 |
+| l1_only | GPU scheduling queue (estimated mean) | n/a | n/a | n/a | n/a | n/a | n/a |
+| l1_only | vLLM queue (raw) | 5950 | 305.607 | 234.375 | 811.585 | 992.988 | 1413.321 |
+
+## Background writes and eviction (ms)
+
+| Arm | Metric | Samples | mean | p95 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| lru | HBM → DRAM STORE | 2365 | 48.961 | 118.796 | 135.442 |
+| lru | DRAM reservation | 4527 | 0.620 | 1.205 | 3.831 |
+| lru | HBM STORE submit → worker acknowledgement | 3946 | 115.444 | 224.471 | 304.995 |
+| lru | DRAM eviction execution | 159 | 10.461 | 28.786 | 50.288 |
+| lru | Eviction candidate selection | n/a | n/a | n/a | n/a |
+| lru | Migration SSD write | n/a | n/a | n/a | n/a |
+| lru_writeback | HBM → DRAM STORE | 2028 | 40.318 | 115.210 | 127.941 |
+| lru_writeback | DRAM reservation | 4638 | 0.609 | 1.126 | 3.195 |
+| lru_writeback | HBM STORE submit → worker acknowledgement | 4017 | 132.133 | 308.188 | 462.839 |
+| lru_writeback | DRAM eviction execution | 117 | 510.363 | 1093.467 | 1188.558 |
+| lru_writeback | Eviction candidate selection | 117 | 0.669 | 0.791 | 0.864 |
+| lru_writeback | Migration SSD write | 117 | 440.950 | 1742.664 | 3770.093 |
+| bidaw | HBM → DRAM STORE | 2370 | 47.433 | 118.718 | 133.775 |
+| bidaw | DRAM reservation | 4394 | 0.742 | 1.546 | 6.865 |
+| bidaw | HBM STORE submit → worker acknowledgement | 3820 | 139.793 | 366.812 | 692.282 |
+| bidaw | DRAM eviction execution | 165 | 14.248 | 35.061 | 80.116 |
+| bidaw | Eviction candidate selection | n/a | n/a | n/a | n/a |
+| bidaw | Migration SSD write | n/a | n/a | n/a | n/a |
+| gandalf | HBM → DRAM STORE | 1539 | 27.587 | 98.158 | 120.549 |
+| gandalf | DRAM reservation | 4885 | 0.858 | 1.395 | 10.449 |
+| gandalf | HBM STORE submit → worker acknowledgement | 4254 | 230.713 | 567.438 | 824.602 |
+| gandalf | DRAM eviction execution | 72 | 1823.216 | 2907.879 | 3062.262 |
+| gandalf | Eviction candidate selection | 72 | 878.224 | 1360.951 | 1631.896 |
+| gandalf | Migration SSD write | 72 | 899.641 | 3122.548 | 4159.687 |
+| l1_only | HBM → DRAM STORE | 4644 | 67.942 | 122.332 | 131.663 |
+| l1_only | DRAM reservation | 5851 | 0.496 | 0.709 | 1.588 |
+| l1_only | HBM STORE submit → worker acknowledgement | 4789 | 105.904 | 168.799 | 219.600 |
+| l1_only | DRAM eviction execution | 194 | 9.057 | 19.145 | 35.967 |
+| l1_only | Eviction candidate selection | n/a | n/a | n/a | n/a |
+| l1_only | Migration SSD write | n/a | n/a | n/a | n/a |
+
+| Arm | Eviction cycles | STORE attempts observed | Allocation failures |
+| --- | ---: | ---: | ---: |
+| lru | 159 | 4527 | 2159 |
+| lru_writeback | 117 | 4638 | 2602 |
+| bidaw | 165 | 4394 | 2017 |
+| gandalf | 72 | 4885 | 3328 |
+| l1_only | 194 | 5851 | 1196 |
+
+Prometheus percentiles are bucket estimates for the full before/after snapshot window.
+Legacy task wall uses the first attempt through the final confirmed load once per task.
+SSD per-request time includes zeros for requests with no reported read.
+Overlapping SSD task windows in one request are counted once in the amortized metric.
+Timings overlap and use different sample populations. The chart and tables do not sum components.

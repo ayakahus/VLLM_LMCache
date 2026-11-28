@@ -1,0 +1,278 @@
+{
+  "report_version": 2,
+  "definitions": {
+    "A": "All observed later lookups hit DRAM",
+    "B1": "No later reuse in the completed observation window",
+    "B2": "SSD copy removed before the first DRAM miss",
+    "B3": "SSD copy present at the first DRAM miss without an effective readback",
+    "C": "Confirmed SSD readback followed by a matching L2 hit",
+    "U": "Incomplete evidence or observation window"
+  },
+  "runs": {
+    "repeat-1/lru": {
+      "log": "/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/logs/prefetch_index_direct_part1_q64_l1_2_l2_4/suite.13Zinbfm/run.NtcDpiOS/repeat-1/lru/l2_events.jsonl",
+      "run_id": "eaa4733376614f099e772b70facb567a",
+      "probe_version": 4,
+      "classes": {
+        "A": 142,
+        "B1": 659,
+        "B2": 0,
+        "B3": 106,
+        "C": 1147,
+        "U": 88
+      },
+      "bytes": {
+        "A": 1042284544,
+        "B1": 4837081088,
+        "B2": 0,
+        "B3": 778043392,
+        "C": 8419016704,
+        "U": 645922816
+      },
+      "physical_writes": 2142,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 2128,
+      "rewrite_events": 14,
+      "load_events": 5192,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 5192,
+      "attributed_loads_per_write": 2.4239028944911296,
+      "writes_read_back": 1147,
+      "readback_prefetch_write_pairs": 5192,
+      "qualifying_prefetch_write_pairs": 5192,
+      "completed_replay_sessions": 284,
+      "delete_events": 1557,
+      "physical_write_bytes": 15722348544,
+      "write_share": {
+        "A": 0.06629318394024276,
+        "B1": 0.30765639589169,
+        "B2": 0.0,
+        "B3": 0.04948646125116713,
+        "C": 0.5354808590102708,
+        "U": 0.04108309990662932
+      },
+      "byte_share": {
+        "A": 0.06629318394024276,
+        "B1": 0.30765639589169,
+        "B2": 0.0,
+        "B3": 0.04948646125116713,
+        "C": 0.5354808590102708,
+        "U": 0.04108309990662932
+      }
+    },
+    "repeat-1/lru_writeback": {
+      "log": "/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/logs/prefetch_index_direct_part1_q64_l1_2_l2_4/suite.13Zinbfm/run.NtcDpiOS/repeat-1/lru_writeback/l2_events.jsonl",
+      "run_id": "bb815d1950b943e3aebd1f94beaf4eee",
+      "probe_version": 4,
+      "classes": {
+        "A": 11,
+        "B1": 730,
+        "B2": 0,
+        "B3": 184,
+        "C": 914,
+        "U": 105
+      },
+      "bytes": {
+        "A": 80740352,
+        "B1": 5358223360,
+        "B2": 0,
+        "B3": 1350565888,
+        "C": 6708789248,
+        "U": 770703360
+      },
+      "physical_writes": 1944,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 1944,
+      "rewrite_events": 0,
+      "load_events": 2953,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 2953,
+      "attributed_loads_per_write": 1.5190329218106995,
+      "writes_read_back": 914,
+      "readback_prefetch_write_pairs": 2953,
+      "qualifying_prefetch_write_pairs": 2953,
+      "completed_replay_sessions": 284,
+      "delete_events": 1359,
+      "physical_write_bytes": 14269022208,
+      "write_share": {
+        "A": 0.00565843621399177,
+        "B1": 0.37551440329218105,
+        "B2": 0.0,
+        "B3": 0.09465020576131687,
+        "C": 0.47016460905349794,
+        "U": 0.05401234567901234
+      },
+      "byte_share": {
+        "A": 0.00565843621399177,
+        "B1": 0.37551440329218105,
+        "B2": 0.0,
+        "B3": 0.09465020576131687,
+        "C": 0.47016460905349794,
+        "U": 0.05401234567901234
+      }
+    },
+    "repeat-1/bidaw": {
+      "log": "/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/logs/prefetch_index_direct_part1_q64_l1_2_l2_4/suite.13Zinbfm/run.NtcDpiOS/repeat-1/bidaw/l2_events.jsonl",
+      "run_id": "cf037d7815064de6a54c22a0aab7c25f",
+      "probe_version": 4,
+      "classes": {
+        "A": 155,
+        "B1": 677,
+        "B2": 0,
+        "B3": 95,
+        "C": 1143,
+        "U": 112
+      },
+      "bytes": {
+        "A": 1137704960,
+        "B1": 4969201664,
+        "B2": 0,
+        "B3": 697303040,
+        "C": 8389656576,
+        "U": 822083584
+      },
+      "physical_writes": 2182,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 2147,
+      "rewrite_events": 35,
+      "load_events": 5331,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 5331,
+      "attributed_loads_per_write": 2.443171402383135,
+      "writes_read_back": 1143,
+      "readback_prefetch_write_pairs": 5331,
+      "qualifying_prefetch_write_pairs": 5331,
+      "completed_replay_sessions": 284,
+      "delete_events": 1597,
+      "physical_write_bytes": 16015949824,
+      "write_share": {
+        "A": 0.07103574702108158,
+        "B1": 0.3102658111824015,
+        "B2": 0.0,
+        "B3": 0.043538038496791935,
+        "C": 0.5238313473877176,
+        "U": 0.051329055912007336
+      },
+      "byte_share": {
+        "A": 0.07103574702108158,
+        "B1": 0.3102658111824015,
+        "B2": 0.0,
+        "B3": 0.043538038496791935,
+        "C": 0.5238313473877176,
+        "U": 0.051329055912007336
+      }
+    },
+    "repeat-1/gandalf": {
+      "log": "/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/logs/prefetch_index_direct_part1_q64_l1_2_l2_4/suite.13Zinbfm/run.NtcDpiOS/repeat-1/gandalf/l2_events.jsonl",
+      "run_id": "81f5076121264f408a867891c011840e",
+      "probe_version": 4,
+      "classes": {
+        "A": 215,
+        "B1": 901,
+        "B2": 411,
+        "B3": 615,
+        "C": 1073,
+        "U": 341
+      },
+      "bytes": {
+        "A": 1578106880,
+        "B1": 6613368832,
+        "B2": 3016753152,
+        "B3": 4514119680,
+        "C": 7875854336,
+        "U": 2502950912
+      },
+      "physical_writes": 3556,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 1621,
+      "rewrite_events": 1935,
+      "load_events": 1169,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 1169,
+      "attributed_loads_per_write": 0.328740157480315,
+      "writes_read_back": 1073,
+      "readback_prefetch_write_pairs": 1169,
+      "qualifying_prefetch_write_pairs": 1169,
+      "completed_replay_sessions": 284,
+      "delete_events": 2971,
+      "physical_write_bytes": 26101153792,
+      "write_share": {
+        "A": 0.06046119235095613,
+        "B1": 0.2533745781777278,
+        "B2": 0.11557930258717661,
+        "B3": 0.17294713160854894,
+        "C": 0.3017435320584927,
+        "U": 0.09589426321709786
+      },
+      "byte_share": {
+        "A": 0.06046119235095613,
+        "B1": 0.2533745781777278,
+        "B2": 0.11557930258717661,
+        "B3": 0.17294713160854894,
+        "C": 0.3017435320584927,
+        "U": 0.09589426321709786
+      }
+    },
+    "repeat-1/l1_only": {
+      "log": "/home/fzz27/vllm_lmcache-fixed/VLLM_LMCache-fixed/logs/prefetch_index_direct_part1_q64_l1_2_l2_4/suite.13Zinbfm/run.NtcDpiOS/repeat-1/l1_only/l2_events.jsonl",
+      "run_id": "7c14395965fa4887a3d36346cad4afe9",
+      "probe_version": 4,
+      "classes": {
+        "A": 0,
+        "B1": 0,
+        "B2": 0,
+        "B3": 0,
+        "C": 0,
+        "U": 0
+      },
+      "bytes": {
+        "A": 0,
+        "B1": 0,
+        "B2": 0,
+        "B3": 0,
+        "C": 0,
+        "U": 0
+      },
+      "physical_writes": 0,
+      "padded_tail_writes": 0,
+      "writes_without_round_evidence": 0,
+      "unique": 0,
+      "rewrite_events": 0,
+      "load_events": 0,
+      "legacy_touch_events": 0,
+      "unattributed_load_events": 0,
+      "attributed_load_events": 0,
+      "attributed_loads_per_write": null,
+      "writes_read_back": 0,
+      "readback_prefetch_write_pairs": 0,
+      "qualifying_prefetch_write_pairs": 0,
+      "completed_replay_sessions": 284,
+      "delete_events": 0,
+      "physical_write_bytes": 0,
+      "write_share": {
+        "A": null,
+        "B1": null,
+        "B2": null,
+        "B3": null,
+        "C": null,
+        "U": null
+      },
+      "byte_share": {
+        "A": null,
+        "B1": null,
+        "B2": null,
+        "B3": null,
+        "C": null,
+        "U": null
+      }
+    }
+  }
+}
