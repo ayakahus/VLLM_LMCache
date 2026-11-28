@@ -19,7 +19,10 @@ _STOP = object()
 
 def _flush_on_sigterm(signum, frame):
     for writer in tuple(_writers):
-        writer.flush()
+        try:
+            writer.flush(timeout=5.0)
+        except Exception:
+            logger.exception("Could not flush Bidaw timing records on SIGTERM")
     if callable(_previous_sigterm):
         _previous_sigterm(signum, frame)
     elif _previous_sigterm == signal.SIG_DFL:
@@ -57,15 +60,19 @@ class TimingLog:
         if not self._closed:
             self._queue.put_nowait(fields)
 
-    def flush(self):
+    def flush(self, *, timeout=None):
         if self._pid != os.getpid():
             return
         with self._control:
-            if self._closed:
+            if self._closed or not self._thread.is_alive():
                 return
             flushed = Event()
             self._queue.put_nowait((_FLUSH, flushed))
-        flushed.wait()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._thread.is_alive():
+            interval = .1 if deadline is None else min(.1, deadline - time.monotonic())
+            if interval <= 0 or flushed.wait(interval):
+                return
 
     def close(self):
         # Producers must be stopped before closing. A forked child has no writer thread.

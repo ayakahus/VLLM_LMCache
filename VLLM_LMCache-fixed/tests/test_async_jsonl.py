@@ -1,15 +1,69 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+from threading import Event, Thread
 import unittest
+from unittest.mock import Mock, patch
 
+from bidaw import async_jsonl
 from bidaw.async_jsonl import TimingLog
 
 
 class TimingLogTests(unittest.TestCase):
+    def test_flush_returns_when_writer_is_already_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(TimingLog, "_drain"):
+                log = TimingLog(Path(directory, "timing.jsonl"))
+            self.addCleanup(log.close)
+            log._thread.join(2)
+            self.assertFalse(log._thread.is_alive())
+            caller = Thread(target=log.flush, daemon=True)
+            caller.start()
+            caller.join(2)
+            self.assertFalse(caller.is_alive())
+
+    def test_flush_timeout_returns_while_writer_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = TimingLog(Path(directory, "timing.jsonl"), interval=60)
+            self.addCleanup(log.close)
+            writing = Event()
+            release = Event()
+            append = log._append
+
+            def blocked_append(records):
+                writing.set()
+                release.wait(5)
+                append(records)
+
+            log.write({"event": "store"})
+            with patch.object(log, "_append", side_effect=blocked_append):
+                caller = Thread(target=lambda: log.flush(timeout=.05), daemon=True)
+                caller.start()
+                try:
+                    self.assertTrue(writing.wait(2))
+                    caller.join(2)
+                    self.assertFalse(caller.is_alive())
+                finally:
+                    release.set()
+                    caller.join(2)
+
+    def test_sigterm_calls_previous_handler_even_when_flush_raises(self):
+        writer = Mock()
+        writer.flush.side_effect = RuntimeError("writer failed")
+        previous = Mock()
+        with (
+            patch.object(async_jsonl, "_writers", (writer,)),
+            patch.object(async_jsonl, "_previous_sigterm", previous),
+            self.assertLogs("bidaw.async_jsonl", level="ERROR"),
+        ):
+            async_jsonl._flush_on_sigterm(signal.SIGTERM, None)
+        writer.flush.assert_called_once_with(timeout=5.0)
+        previous.assert_called_once_with(signal.SIGTERM, None)
+
     def test_flush_and_close_preserve_all_records_from_parallel_producers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "timing.jsonl")

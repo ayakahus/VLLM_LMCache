@@ -3,13 +3,15 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import tempfile
-from threading import Event, Thread
+from threading import Event, Lock, Thread, current_thread
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from bidaw.gandalf_policy import Block, Decision, History, choose, plan_evictions
-from bidaw.gandalf_runtime import Admission, BoundedFS, Settings, SourcePins, _group_kinds, reclaim
+from bidaw.gandalf_runtime import (
+    Admission, BoundedFS, Settings, SourcePins, _group_kinds, _l1_eviction_snapshot, reclaim,
+)
 
 
 @dataclass(frozen=True)
@@ -287,6 +289,33 @@ class HybridPlacementTests(unittest.TestCase):
         self.assertEqual(plan.call_count, 1)
 
 
+class NativeEvictionEligibilityTests(unittest.TestCase):
+    def test_resident_candidates_match_native_read_and_staging_checks(self):
+        from lmcache.v1.distributed.l1_manager.dram import DramL1Manager
+
+        manager = object.__new__(DramL1Manager)
+        manager._lock = Lock()
+        key = Key("resident")
+        for read_locked in (False, True):
+            for staging_locks in (None, (), (False,), (True,), (True, False)):
+                with self.subTest(read_locked=read_locked, staging_locks=staging_locks):
+                    manager._objects = {key: SimpleNamespace(
+                        read_lock=SimpleNamespace(is_locked=lambda: read_locked),
+                        memory_obj=SimpleNamespace(get_size=lambda: 2),
+                    )}
+                    manager._staging = {} if staging_locks is None else {
+                        key: {
+                            tag: SimpleNamespace(write_lock=SimpleNamespace(
+                                is_locked=lambda locked=locked: locked,
+                            ))
+                            for tag, locked in enumerate(staging_locks)
+                        },
+                    }
+                    dram, eligible, _ = _l1_eviction_snapshot(manager, include_staging=False)
+                    self.assertEqual(dram, {key: 2})
+                    self.assertEqual(key in eligible, manager.is_key_evictable(key))
+
+
 class FakeAdapter:
     _use_odirect = False
 
@@ -325,7 +354,83 @@ class BoundedFilesystemTests(unittest.IsolatedAsyncioTestCase):
         self.adapter = FakeAdapter(temporary.name)
         settings = Settings("gandalf", 4, 1, 1, .01, 100, 0, 8)
         self.budget = BoundedFS(self.adapter, settings, FakeAdapter.delete_files)
+        self.addCleanup(self.budget._write_executor.shutdown)
         self.a, self.b, self.c = Key("a"), Key("b"), Key("c")
+
+    async def test_load_only_waits_for_an_unlink_of_its_own_key(self):
+        await self.budget.admit(self.a, b"aa")
+        await self.budget.admit(self.b, b"bb")
+        unlink_started = asyncio.Event()
+        finish_unlink = asyncio.Event()
+        conflict_started = asyncio.Event()
+        load_calls = []
+
+        async def unlink(adapter, keys):
+            self.assertEqual(keys, [self.a])
+            self.assertTrue(self.budget.io_lock.locked())
+            self.assertIn(self.a, self.budget._removing)
+            unlink_started.set()
+            await finish_unlink.wait()
+            return await FakeAdapter.delete_files(adapter, keys)
+
+        async def load(adapter, keys, objects, task_id):
+            load_calls.append(task_id)
+            self.assertTrue(self.budget.readers[keys[0]])
+            return await adapter._key_exists_on_disk(keys[0])
+
+        async def conflicting_load():
+            conflict_started.set()
+            return await self.budget.execute_load([self.a], [], "conflict", load)
+
+        with patch.object(self.budget, "delete_files", side_effect=unlink):
+            store = asyncio.create_task(self.budget.admit(self.c, b"cc", (self.a,)))
+            conflict = None
+            try:
+                await asyncio.wait_for(unlink_started.wait(), 2)
+                conflict = asyncio.create_task(conflicting_load())
+                await asyncio.wait_for(conflict_started.wait(), 2)
+                self.assertTrue(await asyncio.wait_for(
+                    self.budget.execute_load([self.b], [], "independent", load), 2,
+                ))
+                self.assertEqual(load_calls, ["independent"])
+                self.assertFalse(conflict.done())
+                self.assertNotIn(self.a, self.budget.readers)
+            finally:
+                finish_unlink.set()
+                await asyncio.wait_for(store, 2)
+                if conflict is not None:
+                    self.assertFalse(await asyncio.wait_for(conflict, 2))
+        self.assertEqual(load_calls, ["independent", "conflict"])
+        self.assertFalse(self.budget.readers)
+
+    async def test_store_notifies_after_committing_and_uses_the_write_executor(self):
+        write = self.budget._write_file
+        threads = []
+
+        def tracked_write(key, data):
+            threads.append(current_thread().name)
+            write(key, data)
+
+        def inspect_commit(keys, sizes):
+            self.assertTrue(self.budget.lock.acquire(blocking=False))
+            self.budget.lock.release()
+            self.assertEqual(keys, [self.a])
+            self.assertEqual(sizes, [2])
+            self.assertEqual(self.budget.residents, {self.a: 2})
+            self.assertEqual(self.budget.inflight_keys, {})
+            self.assertEqual(self.budget.status(), {
+                "writes": 1, "write_bytes": 2, "used_bytes": 2,
+                "resident_objects": 1, "inflight_bytes": 0,
+            })
+
+        with (
+            patch.object(self.budget, "_write_file", side_effect=tracked_write),
+            patch.object(self.adapter, "_notify_keys_stored", side_effect=inspect_commit) as notify,
+        ):
+            self.assertEqual(await self.budget.admit(self.a, b"aa"), (Admission.STORED, 2))
+        notify.assert_called_once()
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0].startswith("gandalf-ssd-write"))
 
     async def test_duplicate_concurrent_write_counts_once_and_respects_capacity(self):
         results = await asyncio.gather(*(self.budget.admit(self.a, b"aa") for _ in range(2)))
@@ -402,7 +507,7 @@ class BoundedFilesystemTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pinned_victim_blocks_and_io_failure_does_not_count_as_write(self):
         await self.budget.admit(self.a, b"aaaa")
-        self.budget.pin_load([self.a])
+        await self.budget.pin_load([self.a])
         self.assertEqual(await self.budget.admit(self.b, b"bb"), (Admission.BLOCKED, 0))
         self.budget.unpin_load([self.a])
         self.assertTrue(await self.adapter._key_exists_on_disk(self.a))

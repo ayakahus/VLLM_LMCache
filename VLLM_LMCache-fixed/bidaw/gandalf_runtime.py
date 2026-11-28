@@ -2,6 +2,7 @@
 """Opt-in, bounded local-FS tiering for the pinned LMCache MP server."""
 import asyncio
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import copy_context
 from dataclasses import asdict, dataclass, replace
@@ -135,6 +136,9 @@ class BoundedFS:
         self.inflight_bytes = 0
         self.inflight_keys = {}
         self._write_slots = asyncio.Semaphore(settings.write_concurrency)
+        self._write_executor = ThreadPoolExecutor(
+            max_workers=settings.write_concurrency, thread_name_prefix="gandalf-ssd-write",
+        )
         self._active_io = set()
         self._closing = False
         self.source_pins = None
@@ -172,6 +176,7 @@ class BoundedFS:
     def drain_before_close(self):
         if self.adapter._loop.is_running():
             asyncio.run_coroutine_threadsafe(self.drain(), self.adapter._loop).result()
+        self._write_executor.shutdown(wait=True)
 
     def resident_sessions(self):
         with self.lock:
@@ -192,9 +197,22 @@ class BoundedFS:
                 if key in self.residents:
                     self.residents.move_to_end(key)
 
-    def pin_load(self, keys):
-        with self.lock:
-            self.readers.update(keys)
+    async def pin_load(self, keys):
+        while True:
+            with self.lock:
+                if not self._removing or self._removing.isdisjoint(keys):
+                    self.readers.update(keys)
+                    return
+            # Only a read of a key being unlinked waits for the placement lock.
+            async with self.io_lock:
+                pass
+
+    async def execute_load(self, keys, objects, task_id, fs_load):
+        await self.pin_load(keys)
+        try:
+            return await fs_load(self.adapter, keys, objects, task_id)
+        finally:
+            self.unpin_load(keys)
 
     def unpin_load(self, keys):
         with self.lock:
@@ -344,11 +362,12 @@ class BoundedFS:
                 raise asyncio.CancelledError
             async with self._write_slots:
                 loop = asyncio.get_running_loop()
-                write = loop.run_in_executor(None, copy_context().run, self._write_file, key, data)
+                write = loop.run_in_executor(
+                    self._write_executor, copy_context().run, self._write_file, key, data,
+                )
                 cancelled = await _wait_for_io(write)
                 write.result()
                 written = size
-                self.adapter._notify_keys_stored([key], [size])
         except OSError:
             LOGGER.exception("SSD write failed for %s", key)
         finally:
@@ -360,7 +379,13 @@ class BoundedFS:
                     self.counters["write_bytes"] += size
                 self.inflight_bytes -= size
                 del self.inflight_keys[key]
-            reservation.set_result(None)
+            try:
+                if written is not None:
+                    self.adapter._notify_keys_stored([key], [size])
+            except OSError:
+                LOGGER.exception("SSD store notification failed for %s", key)
+            finally:
+                reservation.set_result(None)
         if cancelled:
             raise asyncio.CancelledError
         return (Admission.STORED, written) if written is not None else (Admission.FAILED, 0)
@@ -491,6 +516,23 @@ def status():
             "in_flight_stores": stores["in_flight_task_count"]}
 
 
+def _l1_eviction_snapshot(manager, *, include_staging):
+    with manager._lock:
+        dram = {}
+        eligible = set()
+        for key, entry in manager._objects.items():
+            dram[key] = entry.memory_obj.get_size()
+            # BaseL1Manager.is_key_evictable accepts an unlocked resident OR
+            # any expired staging write lease. delete() checks both locks again.
+            if not entry.read_lock.is_locked() or any(
+                not stage.write_lock.is_locked()
+                for stage in manager._staging.get(key, {}).values()
+            ):
+                eligible.add(key)
+        staging = tuple(manager._staging) if include_staging else ()
+    return dram, eligible, staging
+
+
 def apply_tiering():
     settings = Settings.from_env()
     if settings is None:
@@ -609,13 +651,7 @@ def apply_tiering():
         return await self._gandalf_budget.delete(keys)
 
     async def execute_load(self, keys, objects, task_id):
-        budget = self._gandalf_budget
-        async with budget.io_lock:
-            budget.pin_load(keys)
-        try:
-            return await fs_load(self, keys, objects, task_id)
-        finally:
-            budget.unpin_load(keys)
+        return await self._gandalf_budget.execute_load(keys, objects, task_id, fs_load)
 
     def touch(self, keys):
         self._gandalf_budget.touch(keys)
@@ -633,19 +669,9 @@ def apply_tiering():
             if settings.mode == "lru_writeback":
                 plan = [(Decision(key, "move"), None, None, None) for key in action.keys]
             else:
-                with manager._lock:
-                    dram = {}
-                    eligible = set()
-                    for key, entry in manager._objects.items():
-                        dram[key] = entry.memory_obj.get_size()
-                        # The pinned LMCache version uses a non-reentrant lock.
-                        # Mirror its eviction predicate against this snapshot.
-                        if not entry.read_lock.is_locked() or any(
-                            not stage.write_lock.is_locked()
-                            for stage in manager._staging.get(key, {}).values()
-                        ):
-                            eligible.add(key)
-                    staging = tuple(manager._staging) if history.gc_due() else ()
+                dram, eligible, staging = _l1_eviction_snapshot(
+                    manager, include_staging=history.gc_due(),
+                )
                 disk, pinned, in_flight = budget.placement_snapshot()
                 in_flight.update(staging)
                 decisions = plan_evictions(
