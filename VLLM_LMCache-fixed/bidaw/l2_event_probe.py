@@ -17,6 +17,32 @@ _writer = None
 _logger = logging.getLogger(__name__)
 _l1_cycle = ContextVar("bidaw_l1_cycle", default=None)
 _cycle_lock = threading.Lock()
+active_load = ContextVar("bidaw_ssd_load", default=None)
+
+
+@dataclass
+class SSDLoadTiming:
+    log: object
+    fields: dict
+    started: int
+    conflict_ns: int = 0
+
+    def object_done(self, key, size, odirect, submitted, started, finished, resumed):
+        self.log("load_object_done", [{
+            **_key_fields(key), **self.fields, "bytes": size, "odirect": odirect,
+            "t_submit": submitted, "t_exec_start": started, "t_io_done": finished,
+            "t_resume": resumed, "queue_ms": (started - submitted) / 1e6,
+            "io_ms": (finished - started) / 1e6, "resume_ms": (resumed - finished) / 1e6,
+            "object_wall_ms": (resumed - submitted) / 1e6,
+        }], resumed)
+
+    def task_done(self, num_keys, loaded_keys, size):
+        finished = time.monotonic_ns()
+        self.log("load_task_done", [{
+            **self.fields, "num_keys": num_keys, "loaded_keys": loaded_keys,
+            "bytes": size, "wait_conflict_ms": self.conflict_ns / 1e6,
+            "task_wall_ms": (finished - self.started) / 1e6,
+        }], finished)
 
 
 def l1_cycle_active():
@@ -300,10 +326,14 @@ def apply_l2_event_probe(*, l1_only: bool = False) -> bool:
 
     async def load(self, keys, objects, task_id):
         token = load_task.set(f"{id(self)}:{task_id}")
+        started = time.monotonic_ns()
+        fields = load_fields(self)
+        timing = active_load.set(SSDLoadTiming(log, {"request": None, **fields}, started))
         try:
-            log_keys("load_attempt", keys, load_fields(self))
+            log_keys("load_attempt", keys, fields, started)
             return await execute_load(self, keys, objects, task_id)
         finally:
+            active_load.reset(timing)
             load_task.reset(token)
 
     async def delete(self, keys):

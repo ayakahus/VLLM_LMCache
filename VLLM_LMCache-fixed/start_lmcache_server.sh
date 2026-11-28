@@ -34,12 +34,19 @@ if [[ "${POLICY:-}" == l1_only || "$EVICTION_POLICY" == l1_only ]]; then
 fi
 mkdir -p "${DEMO_DIR}/logs"
 L2_ARGS=()
+export GANDALF_L2_ODIRECT="${GANDALF_L2_ODIRECT:-0}"
+if [[ "$GANDALF_L2_ODIRECT" != 0 && "$GANDALF_L2_ODIRECT" != 1 ]]; then
+    echo "GANDALF_L2_ODIRECT must be 0 or 1." >&2
+    exit 2
+fi
 if [[ "${DISABLE_L2:-0}" == 1 ]]; then
     EVICTION_POLICY=LRU
     LMCACHE_L2_PATH=disabled
 else
     mkdir -p "$LMCACHE_L2_PATH"
-    l2_adapter=$(python3 -c 'import json,sys; print(json.dumps(dict(type="fs", base_path=sys.argv[1])))' "$LMCACHE_L2_PATH")
+    l2_adapter=$(python3 -c 'import json,sys; print(json.dumps(dict(
+        type="fs", base_path=sys.argv[1], use_odirect=sys.argv[2] == "1")))' \
+        "$LMCACHE_L2_PATH" "$GANDALF_L2_ODIRECT")
     L2_ARGS=(--l2-prefetch-policy retain --l2-adapter "$l2_adapter")
 fi
 

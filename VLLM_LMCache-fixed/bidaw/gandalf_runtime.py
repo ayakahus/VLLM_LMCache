@@ -3,9 +3,11 @@
 import asyncio
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import copy_context
+import ctypes
 from dataclasses import asdict, dataclass, replace
+import errno
 from enum import Enum, auto
 from functools import wraps
 import logging
@@ -16,10 +18,12 @@ from threading import Lock
 import time
 
 from bidaw.gandalf_policy import Block, Decision, History, plan_evictions
-from bidaw.l2_event_probe import l1_cycle_active, record_l1_cycle_phase, record_tier_event
+from bidaw.l2_event_probe import active_load, l1_cycle_active, record_l1_cycle_phase, record_tier_event
 
 LOGGER = logging.getLogger(__name__)
 _STORAGE = None
+_ODIRECT_COUNTERS = ("odirect_reads", "odirect_read_fallbacks",
+                     "odirect_writes", "odirect_write_fallbacks")
 
 
 class Admission(Enum):
@@ -39,6 +43,7 @@ class Settings:
     target_days: float
     horizon: int
     write_concurrency: int = 8
+    read_workers: int = 16
 
     @classmethod
     def from_env(cls):
@@ -55,12 +60,18 @@ class Settings:
         days = float(os.environ.get("GANDALF_TARGET_DAYS", "0"))
         horizon = int(os.environ.get("GANDALF_RETURN_HORIZON", "128"))
         concurrency = int(os.environ.get("GANDALF_L2_WRITE_CONCURRENCY", "8"))
+        try:
+            read_workers = int(os.environ.get("GANDALF_L2_READ_WORKERS", "16"))
+        except ValueError as exc:
+            raise ValueError("GANDALF_L2_READ_WORKERS must be a positive integer") from exc
+        if read_workers <= 0:
+            raise ValueError("GANDALF_L2_READ_WORKERS must be a positive integer")
         if (capacity <= 0 or horizon <= 0 or concurrency <= 0
                 or not all(math.isfinite(x) for x in (alpha, recompute, drive_price, endurance, days))
                 or min(recompute, drive_price, endurance) <= 0 or min(alpha, days) < 0):
             raise ValueError("Invalid Gandalf capacity, prediction horizon, write concurrency or cost settings")
         return cls(mode, capacity, alpha, recompute, drive_price / endurance,
-                   endurance, days, horizon, concurrency)
+                   endurance, days, horizon, concurrency, read_workers)
 
 
 async def _wait_for_io(future):
@@ -78,8 +89,65 @@ async def _wait_for_io(future):
     return cancelled
 
 
+def _direct_aligned(adapter, data):
+    alignment = max(4096, adapter._os_disk_bs)
+    if not data or len(data) % alignment:
+        return False
+    try:
+        address = ctypes.addressof(ctypes.c_char.from_buffer(data))
+    except (TypeError, ValueError, BufferError):
+        return False
+    return address % alignment == 0
+
+
+def _read_full(read, data):
+    offset = 0
+    while offset < len(data):
+        size = read(data[offset:])
+        if not size:
+            break
+        offset += size
+    return offset
+
+
+def _read_one_object(adapter, key, obj):
+    path = adapter._key_to_path(key)
+    with memoryview(obj.byte_array).cast("B") as data:
+        if adapter._use_odirect:
+            if _direct_aligned(adapter, data):
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                    try:
+                        size = _read_full(lambda dest: os.readv(fd, [dest]), data)
+                    finally:
+                        os.close(fd)
+                except OSError as exc:
+                    if exc.errno != errno.EINVAL:
+                        raise
+                else:
+                    if size == len(data):
+                        adapter._gandalf_budget.increment("odirect_reads")
+                    return size, len(data), True
+            adapter._gandalf_budget.increment("odirect_read_fallbacks")
+        with path.open("rb") as stream:
+            ahead = adapter._read_ahead_size if not adapter._use_odirect else None
+            if ahead is None:
+                size = _read_full(stream.readinto, data)
+            else:
+                size = _read_full(stream.readinto, data[:ahead])
+                if size == ahead:
+                    size += _read_full(stream.readinto, data[ahead:])
+        return size, len(data), False
+
+
+def _timed_read(adapter, key, obj):
+    started = time.monotonic_ns()
+    result = _read_one_object(adapter, key, obj)
+    return result, started, time.monotonic_ns()
+
+
 class SourcePins:
-    """Defer returning an exported DRAM buffer to the pool until I/O is done."""
+    """Defer returning a DRAM buffer to the pool until SSD I/O is done."""
 
     def __init__(self, memory_manager, success_code):
         self._lock = Lock()
@@ -139,6 +207,9 @@ class BoundedFS:
         self._write_executor = ThreadPoolExecutor(
             max_workers=settings.write_concurrency, thread_name_prefix="gandalf-ssd-write",
         )
+        self._read_executor = ThreadPoolExecutor(
+            max_workers=settings.read_workers, thread_name_prefix="gandalf-ssd-read",
+        )
         self._active_io = set()
         self._closing = False
         self.source_pins = None
@@ -176,6 +247,7 @@ class BoundedFS:
     def drain_before_close(self):
         if self.adapter._loop.is_running():
             asyncio.run_coroutine_threadsafe(self.drain(), self.adapter._loop).result()
+        self._read_executor.shutdown(wait=True)
         self._write_executor.shutdown(wait=True)
 
     def resident_sessions(self):
@@ -184,7 +256,8 @@ class BoundedFS:
 
     def status(self):
         with self.lock:
-            return {**self.counters, "used_bytes": self.used, "resident_objects": len(self.residents),
+            return {**dict.fromkeys(_ODIRECT_COUNTERS, 0), **self.counters,
+                    "used_bytes": self.used, "resident_objects": len(self.residents),
                     "inflight_bytes": self.inflight_bytes}
 
     def increment(self, field, value=1):
@@ -198,21 +271,98 @@ class BoundedFS:
                     self.residents.move_to_end(key)
 
     async def pin_load(self, keys):
+        probe = active_load.get()
         while True:
             with self.lock:
                 if not self._removing or self._removing.isdisjoint(keys):
                     self.readers.update(keys)
                     return
             # Only a read of a key being unlinked waits for the placement lock.
+            started = time.monotonic_ns() if probe is not None else None
             async with self.io_lock:
-                pass
+                if probe is not None:
+                    probe.conflict_ns += time.monotonic_ns() - started
 
-    async def execute_load(self, keys, objects, task_id, fs_load):
-        await self.pin_load(keys)
+    async def execute_load(self, keys, objects, task_id, fs_load=None):
+        task = asyncio.current_task()
+        if self._closing:
+            return self._complete_load(keys, (), task_id)
+        self._active_io.add(task)
         try:
-            return await fs_load(self.adapter, keys, objects, task_id)
+            await self.pin_load(keys)
+            try:
+                if fs_load is not None:
+                    return await fs_load(self.adapter, keys, objects, task_id)
+                # Shield the whole batch so cancellation never recycles an L1
+                # destination or releases an SSD pin while a thread is reading.
+                reads = asyncio.gather(
+                    *(self._read_object(key, obj) for key, obj in zip(keys, objects)),
+                    return_exceptions=True,
+                )
+                if await _wait_for_io(reads):
+                    raise asyncio.CancelledError
+                sizes = reads.result()
+                for result in sizes:
+                    if isinstance(result, BaseException):
+                        raise result
+                return self._complete_load(keys, sizes, task_id)
+            finally:
+                self.unpin_load(keys)
         finally:
-            self.unpin_load(keys)
+            self._active_io.discard(task)
+
+    async def _read_object(self, key, obj):
+        probe = active_load.get()
+        lease = self.source_pins.hold(obj) if self.source_pins is not None else nullcontext(True)
+        try:
+            with lease as available:
+                if not available:
+                    return None
+                loop = asyncio.get_running_loop()
+                submitted = time.monotonic_ns() if probe is not None else None
+                read = loop.run_in_executor(
+                    self._read_executor, _timed_read if probe is not None else _read_one_object,
+                    self.adapter, key, obj,
+                )
+                if await _wait_for_io(read):
+                    raise asyncio.CancelledError
+                result = read.result()
+                if probe is not None:
+                    resumed = time.monotonic_ns()
+                    result, started, finished = result
+            size, expected, odirect = result
+            if size != expected:
+                LOGGER.warning("Incomplete SSD read for %s: expected %d, got %d",
+                               key, expected, size)
+                return None
+            if probe is not None:
+                probe.object_done(key, size, odirect, submitted, started, finished, resumed)
+            return size
+        except FileNotFoundError:
+            return None
+        except Exception:
+            LOGGER.exception("SSD read failed for %s", key)
+            return None
+
+    def _complete_load(self, keys, sizes, task_id):
+        from lmcache.lmcache_native import Bitmap
+
+        bitmap = Bitmap(len(keys))
+        loaded = []
+        size = 0
+        for idx, read_bytes in enumerate(sizes):
+            if read_bytes is not None:
+                bitmap.set(idx)
+                loaded.append(keys[idx])
+                size += read_bytes
+        probe = active_load.get()
+        if probe is not None:
+            probe.task_done(len(keys), len(loaded), size)
+        if loaded:
+            self.adapter._notify_keys_accessed(loaded)
+        with self.adapter._lock:
+            self.adapter._completed_load_tasks[task_id] = bitmap
+        self.adapter._load_efd.notify()
 
     def unpin_load(self, keys):
         with self.lock:
@@ -261,15 +411,37 @@ class BoundedFS:
         final, temporary = self.adapter._key_to_file_and_tmp_path(key)
         started = time.monotonic_ns() if l1_cycle_active() else None
         try:
+            odirect = False
             if self.adapter._use_odirect:
-                self.adapter._write_with_odirect(temporary, data)
-            else:
+                if _direct_aligned(self.adapter, data):
+                    try:
+                        fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_DIRECT, 0o644)
+                        try:
+                            with memoryview(data).cast("B") as view:
+                                sent = 0
+                                while sent < len(view):
+                                    count = os.write(fd, view[sent:])
+                                    if count <= 0:
+                                        raise OSError(errno.EIO, "SSD write made no progress")
+                                    sent += count
+                        finally:
+                            os.close(fd)
+                    except OSError as exc:
+                        if exc.errno != errno.EINVAL:
+                            raise
+                    else:
+                        odirect = True
+                if not odirect:
+                    self.increment("odirect_write_fallbacks")
+            if not odirect:
                 with temporary.open("wb") as stream:
                     if stream.write(data) != len(data):
                         raise OSError(f"Short write to {temporary}")
             if temporary.stat().st_size != len(data):
                 raise OSError(f"Unexpected size for {temporary}")
             temporary.replace(final)
+            if odirect:
+                self.increment("odirect_writes")
         finally:
             if started is not None:
                 record_l1_cycle_phase("ssd_write_ms", (time.monotonic_ns() - started) / 1e6)
@@ -511,6 +683,7 @@ def status():
     _, l1_capacity = _STORAGE._eviction_controllers[0]._l1_manager.get_memory_usage()
     return {**budget.status(), "mode": budget.settings.mode,
             "capacity_bytes": budget.settings.capacity, "alpha": budget.settings.alpha,
+            "read_workers": budget.settings.read_workers, "use_odirect": budget.adapter._use_odirect,
             "l1_capacity_bytes": l1_capacity,
             "pending_keys": stores["pending_keys_count"],
             "in_flight_stores": stores["in_flight_task_count"]}
@@ -575,7 +748,6 @@ def apply_tiering():
 
     fs_init = FSL2Adapter.__init__
     fs_delete = FSL2Adapter._execute_delete
-    fs_load = FSL2Adapter._execute_load
     fs_touch = FSL2Adapter._notify_keys_accessed
     fs_close = FSL2Adapter.close
     manager_close = StorageManager.close
@@ -615,8 +787,8 @@ def apply_tiering():
         return fs_close(self)
 
     def close_manager(self):
-        # StoreController.stop releases its in-flight source pins. Drain and
-        # reject new admissions before native shutdown is allowed to do that.
+        # Native controller shutdown releases staging and STORE leases.
+        # Drain both pools first so their buffers remain valid through I/O.
         for adapter in self._l2_adapters.values():
             if hasattr(adapter, "_gandalf_budget"):
                 adapter._gandalf_budget.drain_before_close()
@@ -651,7 +823,7 @@ def apply_tiering():
         return await self._gandalf_budget.delete(keys)
 
     async def execute_load(self, keys, objects, task_id):
-        return await self._gandalf_budget.execute_load(keys, objects, task_id, fs_load)
+        return await self._gandalf_budget.execute_load(keys, objects, task_id)
 
     def touch(self, keys):
         self._gandalf_budget.touch(keys)

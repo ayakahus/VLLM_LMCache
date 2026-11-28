@@ -20,6 +20,13 @@ unset BIDAW_FORCE_POLICY
 unset POLICY
 export GANDALF_PARALLEL="$parallel"
 export GANDALF_HYBRID="${GANDALF_HYBRID:-0}"
+export GANDALF_L2_ODIRECT="${GANDALF_L2_ODIRECT:-0}"
+export GANDALF_L2_READ_WORKERS="${GANDALF_L2_READ_WORKERS:-16}"
+if [[ "$GANDALF_L2_ODIRECT" != 0 && "$GANDALF_L2_ODIRECT" != 1 ]] ||
+   [[ ! "$GANDALF_L2_READ_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Set GANDALF_L2_ODIRECT to 0 or 1 and GANDALF_L2_READ_WORKERS to a positive integer." >&2
+    exit 2
+fi
 model_dir=models/Qwen2.5-1.5B-Instruct
 replay_model_args=()
 if [[ "$GANDALF_HYBRID" == 1 ]]; then
@@ -47,6 +54,8 @@ if [[ "${1:-}" == "--plan" ]]; then
     printf 'users=%s speed=%s parallel=%s repeats=%s L1_GiB=%s L2_bytes=%s seed=%s\n' \
         "$users" "$speed" "$parallel" "$repeats" "$l1_gb" "$l2_bytes" "$seed"
     printf 'arms=%s trace_dir=%s\n' "${arms[*]}" "$trace_dir"
+    printf 'GANDALF_L2_ODIRECT=%s GANDALF_L2_READ_WORKERS=%s\n' \
+        "$GANDALF_L2_ODIRECT" "$GANDALF_L2_READ_WORKERS"
     exit 0
 fi
 if [[ $# != 0 || ${#arms[@]} == 0 || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
@@ -96,6 +105,8 @@ PY
 
 mkdir -p "$run_parent"
 run_root=$(mktemp -d "${run_parent}/run.XXXXXXXX")
+printf 'GANDALF_L2_ODIRECT=%s\nGANDALF_L2_READ_WORKERS=%s\n' \
+    "$GANDALF_L2_ODIRECT" "$GANDALF_L2_READ_WORKERS" >"$run_root/settings.txt"
 cache_run=
 if [[ "$with_l2" == 1 ]]; then
     mkdir -p "$cache_root"

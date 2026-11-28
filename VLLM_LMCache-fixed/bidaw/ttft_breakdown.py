@@ -27,8 +27,14 @@ PATH_METRICS = {
     "server_ttft": "Server TTFT",
     "gpu_prefill": "vLLM prefill",
     "lookup": "LMCache lookup",
-    "ssd_read": "SSD → DRAM object read",
+    "ssd_load_task_ms": "SSD load task wall",
+    "ssd_object_io_ms": "SSD object pure I/O",
+    "ssd_object_overhead_ms": "SSD object queue + resume",
+    "ssd_object_wall_ms": "SSD object read (submit → done)",
+    "ssd_read": "Legacy SSD task wall (object-weighted)",
     "ssd_per_request": "SSD read time per request",
+    "lookup_to_load_attempt_ms": "Lookup → SSD load attempt",
+    "ssd_load_conflict_ms": "SSD load wait for conflicting delete",
     "prefetch": "LMCache prefetch lookup → hit",
     "retrieve": "DRAM → GPU RETRIEVE",
     "gpu_queue": "GPU scheduling queue",
@@ -168,9 +174,13 @@ def record_ssd_and_prefetch(events, measured, samples, request_count, *, has_io_
     lookup_round = {}
     hit_end = {}
     intervals = defaultdict(list)
+    task_attempts = {}
+    legacy_spans = defaultdict(list)
+    detailed_tasks = set()
     for event in events:
         kind = event["ev"]
-        if kind not in {"lookup", "l1_hit", "l2_hit", "load_attempt", "load"}:
+        if kind not in {"lookup", "l1_hit", "l2_hit", "load_attempt", "load",
+                        "load_task_done", "load_object_done"}:
             continue
         timestamp = event["t_ns"]
         if kind == "lookup" and measured(event):
@@ -182,19 +192,43 @@ def record_ssd_and_prefetch(events, measured, samples, request_count, *, has_io_
             request = event["request"]
             if request in lookup_start:
                 hit_end[request] = timestamp
-        elif kind in {"load_attempt", "load"} and event.get("io_task"):
-            key = (event["io_task"], event["adapter"], object_key(event))
+        elif event.get("io_task"):
+            task = (event["io_task"], event["adapter"])
+            if kind == "load_task_done":
+                if task in task_attempts or measured(event):
+                    detailed_tasks.add(task)
+                    add_value(samples, "ssd_load_task_ms", event.get("task_wall_ms"))
+                    add_value(samples, "ssd_load_conflict_ms", event.get("wait_conflict_ms"))
+                continue
+            if kind == "load_object_done":
+                if measured(event):
+                    add_value(samples, "ssd_object_io_ms", event.get("io_ms"))
+                    add_value(samples, "ssd_object_wall_ms", event.get("object_wall_ms"))
+                    queue, resume = event.get("queue_ms"), event.get("resume_ms")
+                    if queue is not None and resume is not None:
+                        add_value(samples, "ssd_object_overhead_ms", queue + resume)
+                continue
+            key = (*task, object_key(event))
             if kind == "load_attempt" and measured(event):
                 attempts[key] = event
+                task_attempts.setdefault(task, (timestamp, event.get("request")))
             elif kind == "load":
                 attempt = attempts.pop(key, None)
                 if attempt is not None:
                     started = attempt["t_ns"]
-                    add_value(samples, "ssd_read", duration(started, timestamp))
+                    legacy_spans[task].append((started, timestamp))
                     request = attempt.get("request")
                     if request and started <= timestamp:
                         scope = attempt.get("round_id") or lookup_round.get(request) or request
                         intervals[scope].append((started, timestamp))
+    for timestamp, request in task_attempts.values():
+        add_value(samples, "lookup_to_load_attempt_ms", duration(lookup_start.get(request), timestamp))
+    for task, spans in legacy_spans.items():
+        if task not in detailed_tasks:
+            start = task_attempts[task][0]
+            add_value(samples, "ssd_load_task_ms", duration(start, max(end for _, end in spans)))
+            for begin, end in spans:
+                add_value(samples, "ssd_read", duration(begin, end))
     for request, end in hit_end.items():
         add_value(samples, "prefetch", duration(lookup_start[request], end))
     # Older v4 probes still carry exact task IDs. An unpaired legacy load
@@ -375,8 +409,9 @@ def render(results):
                   for key in ("eviction_cycles", "store_attempts_observed", "allocation_failures")]
         lines.append(f"| {arm} | " + " | ".join(map(str, values)) + " |")
     lines.extend(["", "Prometheus percentiles are bucket estimates for the full before/after snapshot window.",
+                  "Legacy task wall uses the first attempt through the final confirmed load once per task.",
                   "SSD per-request time includes zeros for requests with no reported read.",
-                  "Overlapping object reads in one request are counted once in the amortized metric.",
+                  "Overlapping SSD task windows in one request are counted once in the amortized metric.",
                   "Timings overlap and use different sample populations. The chart and tables do not sum components."])
     return "\n".join(lines) + "\n"
 
@@ -420,7 +455,8 @@ def plot_with_pillow(results, output):
     """Render the same means in the pinned serving environment."""
     from PIL import Image, ImageDraw, ImageFont
 
-    width, height = 1300, 1090
+    background_top = 210 + 46 * len(PATH_METRICS)
+    width, height = 1300, background_top + 46 * len(BACKGROUND_METRICS) + 98
     image = Image.new("RGB", (width, height), "#ffffff")
     draw = ImageDraw.Draw(image)
 
@@ -439,7 +475,7 @@ def plot_with_pillow(results, output):
         draw.text((x + 24, 70), arm, fill="#182930", font=text_font)
     for top, group, title in (
         (120, PATH_METRICS, "TTFT and request stages"),
-        (716, BACKGROUND_METRICS, "Background write and eviction"),
+        (background_top, BACKGROUND_METRICS, "Background write and eviction"),
     ):
         left, right = 498, width - 75
         bottom = top + 46 * len(group) + 54

@@ -1,16 +1,20 @@
 import asyncio
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+import errno
+import mmap
+import os
 from pathlib import Path
 import tempfile
 from threading import Event, Lock, Thread, current_thread
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bidaw.gandalf_policy import Block, Decision, History, choose, plan_evictions
 from bidaw.gandalf_runtime import (
-    Admission, BoundedFS, Settings, SourcePins, _group_kinds, _l1_eviction_snapshot, reclaim,
+    Admission, BoundedFS, Settings, SourcePins, _group_kinds, _l1_eviction_snapshot,
+    _read_one_object, reclaim,
 )
 
 
@@ -318,14 +322,23 @@ class NativeEvictionEligibilityTests(unittest.TestCase):
 
 class FakeAdapter:
     _use_odirect = False
+    _read_ahead_size = None
+    _os_disk_bs = 512
 
     def __init__(self, directory):
         self.directory = Path(directory)
         self.writes = []
         self.deleted = []
+        self.accessed = []
+        self._lock = Lock()
+        self._completed_load_tasks = {}
+        self._load_efd = Mock()
 
     def _key_to_file_and_tmp_path(self, key):
         return self.directory / key.name, self.directory / (key.name + ".tmp")
+
+    def _key_to_path(self, key):
+        return self.directory / key.name
 
     async def _key_exists_on_disk(self, key):
         return self._key_to_file_and_tmp_path(key)[0].is_file()
@@ -335,6 +348,9 @@ class FakeAdapter:
 
     def _notify_keys_deleted(self, keys, sizes):
         self.deleted.extend(zip(keys, sizes, strict=True))
+
+    def _notify_keys_accessed(self, keys):
+        self.accessed.extend(keys)
 
     async def delete_files(self, keys):
         removed, sizes = [], []
@@ -354,8 +370,125 @@ class BoundedFilesystemTests(unittest.IsolatedAsyncioTestCase):
         self.adapter = FakeAdapter(temporary.name)
         settings = Settings("gandalf", 4, 1, 1, .01, 100, 0, 8)
         self.budget = BoundedFS(self.adapter, settings, FakeAdapter.delete_files)
+        self.adapter._gandalf_budget = self.budget
         self.addCleanup(self.budget._write_executor.shutdown)
+        self.addCleanup(self.budget._read_executor.shutdown)
         self.a, self.b, self.c = Key("a"), Key("b"), Key("c")
+
+    async def test_batch_reads_concurrently_and_reports_partial_success_in_input_order(self):
+        missing, failed, short = (Key(name) for name in ("missing", "failed", "short"))
+        keys = [self.a, missing, failed, short, self.b]
+        objects = [SimpleNamespace(byte_array=bytearray(2)) for _ in keys]
+        for key, payload in ((self.a, b"aa"), (self.b, b"bb"), (short, b"s")):
+            self.adapter._key_to_path(key).write_bytes(payload)
+        loop = asyncio.get_running_loop()
+        started = asyncio.Queue()
+        finish = Event()
+
+        def read(adapter, key, obj):
+            if key == failed:
+                raise OSError(errno.EIO, "test I/O failure")
+            if key in (self.a, self.b):
+                loop.call_soon_threadsafe(started.put_nowait, (key, current_thread().name))
+                if not finish.wait(5):
+                    raise TimeoutError("concurrent read did not start")
+            return _read_one_object(adapter, key, obj)
+
+        with (patch("bidaw.gandalf_runtime._read_one_object", side_effect=read),
+              self.assertLogs("bidaw.gandalf_runtime", level="WARNING")):
+            batch = asyncio.create_task(self.budget.execute_load(keys, objects, 7))
+            try:
+                workers = [await asyncio.wait_for(started.get(), 2) for _ in range(2)]
+                self.assertCountEqual([key for key, _ in workers], [self.a, self.b])
+                self.assertTrue(all(name.startswith("gandalf-ssd-read") for _, name in workers))
+            finally:
+                finish.set()
+                self.assertIsNone(await asyncio.wait_for(batch, 2))
+        self.assertEqual(self.adapter._completed_load_tasks[7].get_indices_list(), [0, 4])
+        self.assertEqual(self.adapter.accessed, [self.a, self.b])
+        self.adapter._load_efd.notify.assert_called_once_with()
+        self.assertEqual([objects[i].byte_array for i in (0, 4)], [b"aa", b"bb"])
+        self.assertFalse(self.budget.readers)
+
+    async def test_cancelled_load_retains_destination_and_ssd_pins_until_worker_exits(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        finish = Event()
+        freed = []
+        memory_manager = SimpleNamespace(free=freed.extend)
+        self.budget.source_pins = SourcePins(memory_manager, "ok")
+        obj = SimpleNamespace(byte_array=bytearray(2), is_valid=lambda: True)
+
+        def read(adapter, key, destination):
+            loop.call_soon_threadsafe(started.set)
+            if not finish.wait(5):
+                raise TimeoutError("read not released")
+            destination.byte_array[:] = b"ok"
+            return 2, 2, False
+
+        with patch("bidaw.gandalf_runtime._read_one_object", side_effect=read):
+            batch = asyncio.create_task(self.budget.execute_load([self.a], [obj], 7))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                batch.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(batch.done())
+                self.assertEqual(self.budget.readers[self.a], 1)
+                self.assertEqual(memory_manager.free([obj]), "ok")
+                self.assertFalse(freed)
+            finally:
+                finish.set()
+                await asyncio.gather(batch, return_exceptions=True)
+        self.assertTrue(batch.cancelled())
+        self.assertEqual(obj.byte_array, b"ok")
+        self.assertEqual(freed, [obj])
+        self.assertFalse(self.budget.readers)
+        self.assertFalse(self.adapter._completed_load_tasks)
+
+    def test_odirect_counts_aligned_reads_and_writes_and_unaligned_fallbacks(self):
+        self.adapter._use_odirect = True
+        native_open = os.open
+        direct_calls = []
+
+        def open_file(path, flags, *args):
+            if flags & os.O_DIRECT:
+                direct_calls.append(path)
+            return native_open(path, flags & ~os.O_DIRECT, *args)
+
+        with (mmap.mmap(-1, 8192) as mapping, memoryview(mapping) as view,
+              view[:4096] as aligned, view[1:4097] as unaligned,
+              patch("bidaw.gandalf_runtime.os.open", side_effect=open_file)):
+            aligned[:] = b"a" * 4096
+            self.budget._write_file(self.a, aligned)
+            self.assertEqual(_read_one_object(self.adapter, self.a, SimpleNamespace(byte_array=aligned)),
+                             (4096, 4096, True))
+            unaligned[:] = b"b" * 4096
+            self.budget._write_file(self.b, unaligned)
+            self.assertEqual(_read_one_object(self.adapter, self.b, SimpleNamespace(byte_array=unaligned)),
+                             (4096, 4096, False))
+        self.assertEqual(len(direct_calls), 2)
+        for name in ("odirect_reads", "odirect_read_fallbacks", "odirect_writes", "odirect_write_fallbacks"):
+            self.assertEqual(self.budget.status()[name], 1)
+
+    def test_odirect_einval_retries_in_buffered_mode(self):
+        self.adapter._use_odirect = True
+        native_open = os.open
+
+        def open_file(path, flags, *args):
+            if flags & os.O_DIRECT:
+                raise OSError(errno.EINVAL, "direct I/O unavailable")
+            return native_open(path, flags, *args)
+
+        with (mmap.mmap(-1, 4096) as mapping, memoryview(mapping) as view,
+              patch("bidaw.gandalf_runtime.os.open", side_effect=open_file)):
+            view[:] = b"a" * 4096
+            self.budget._write_file(self.a, view)
+            self.assertEqual(_read_one_object(self.adapter, self.a, SimpleNamespace(byte_array=view)),
+                             (4096, 4096, False))
+            self.assertEqual(bytes(view), b"a" * 4096)
+        self.assertEqual(self.budget.status()["odirect_write_fallbacks"], 1)
+        self.assertEqual(self.budget.status()["odirect_read_fallbacks"], 1)
+        self.assertEqual(self.budget.status()["odirect_reads"], 0)
 
     async def test_load_only_waits_for_an_unlink_of_its_own_key(self):
         await self.budget.admit(self.a, b"aa")
@@ -421,6 +554,8 @@ class BoundedFilesystemTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.budget.status(), {
                 "writes": 1, "write_bytes": 2, "used_bytes": 2,
                 "resident_objects": 1, "inflight_bytes": 0,
+                "odirect_reads": 0, "odirect_read_fallbacks": 0,
+                "odirect_writes": 0, "odirect_write_fallbacks": 0,
             })
 
         with (
